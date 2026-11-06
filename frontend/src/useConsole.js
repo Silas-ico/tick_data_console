@@ -1,8 +1,9 @@
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from './api'
 
 
 const terminalStatuses = new Set(['success', 'failed'])
+const EVENT_PAGE_SIZE = 500
 
 export function useConsole() {
   const section = ref('dashboard')
@@ -13,14 +14,9 @@ export function useConsole() {
   const selectedZipIds = ref([])
   const localDirectory = ref('')
   const localRootDirectory = ref('')
-  const localBrowserPath = ref('')
-  const localBrowserRootPath = ref('')
-  const localBrowserLastPath = ref('')
-  const localBrowserDirectories = ref([])
-  const localBrowserOpen = ref(false)
-  const localDirectoryMenuOpen = ref(false)
   const mergeScope = ref('month')
   const localArchives = ref([])
+  const selectedLocalArchiveIds = ref([])
   const monthDirectories = ref([])
   const selectedMonthDirectories = ref([])
   const scanMessage = ref('')
@@ -33,10 +29,20 @@ export function useConsole() {
   const databaseTablesError = ref('')
   const databaseRecords = ref(null)
   const databaseQuery = ref({ table_name: '', keyword: '', code: '', start_time: '', end_time: '', page: 1, page_size: 50 })
+  const coverageTable = ref('')
+  const coverageYear = ref(null)
+  const coverageMonth = ref(null)
+  const databaseCoverage = ref(null)
+  const coverageError = ref('')
+  const coverageSnapshots = new Map()
   const adjustDuplicates = ref(true)
   const selectedTask = ref(null)
   const taskEvents = ref([])
-  const busy = ref({ scan: false, extract: false, validate: false, import: false, db: false, query: false, cleanup: false, directory: false })
+  const hasOlderEvents = ref(false)
+  const hasNewerEvents = ref(false)
+  const eventHistoryBusy = ref(false)
+  const sseStatus = ref('disconnected')
+  const busy = ref({ scan: false, upload: false, extract: false, validate: false, import: false, db: false, query: false, coverage: false, cleanup: false, directory: false })
   const cleanupConfirmOpen = ref(false)
   const notice = ref(null)
   const database = ref({
@@ -48,13 +54,14 @@ export function useConsole() {
     charset: 'utf8mb4',
   })
   const sources = new Map()
+  const eventIds = new Set()
+  const pendingEvents = new Map()
+  let eventFlushTimer = null
   let noticeTimer
 
   if (typeof window !== 'undefined') {
     localRootDirectory.value = window.localStorage.getItem('tick-data-console.local-root') || ''
     localDirectory.value = window.localStorage.getItem('tick-data-console.local-directory') || ''
-    localBrowserRootPath.value = window.localStorage.getItem('tick-data-console.local-browser-root') || ''
-    localBrowserLastPath.value = window.localStorage.getItem('tick-data-console.local-browser-path') || ''
   }
 
   const zipFiles = computed(() => files.value.filter((file) => file.extension === '.zip'))
@@ -63,7 +70,7 @@ export function useConsole() {
     const isRejectedFile = /[_-]rejected(?:\.[^.]+)?$/i.test(file.name || '')
     return isLogFile && !isRejectedFile
   }))
-  const runningTasks = computed(() => tasks.value.filter((task) => ['pending', 'running'].includes(task.status)))
+  const runningTasks = computed(() => tasks.value.filter((task) => ['pending', 'running', 'pausing', 'paused'].includes(task.status)))
   const successfulTasks = computed(() => tasks.value.filter((task) => task.status === 'success'))
   const failedTasks = computed(() => tasks.value.filter((task) => task.status === 'failed'))
   const latestValidation = computed(() => tasks.value.find((task) => task.type === 'validate' && task.status === 'success')?.result)
@@ -157,6 +164,7 @@ export function useConsole() {
 
   watch([localDirectory, mergeScope], () => {
     localArchives.value = []
+    selectedLocalArchiveIds.value = []
     monthDirectories.value = []
     selectedMonthDirectories.value = []
     scanMessage.value = ''
@@ -227,7 +235,9 @@ export function useConsole() {
 
   async function loadTasks() {
     tasks.value = await api.tasks()
-    tasks.value.filter((task) => !terminalStatuses.has(task.status)).forEach(connectTask)
+    tasks.value.filter((task) => !terminalStatuses.has(task.status)).forEach((task) => {
+      connectTask(task, task.last_event_id || 0)
+    })
   }
 
   async function loadDatabase() {
@@ -251,6 +261,7 @@ export function useConsole() {
       }
       refreshDerivedFields()
       if (section.value === 'records' && (!databaseRecords.value || !databaseRecords.value.table_name)) queryDatabaseRecords()
+      if (section.value === 'coverage') queryDatabaseCoverage({ year: null, month: null, refresh: true })
     } catch (error) {
       databaseTables.value = []
       databaseTablesError.value = errorMessage(error)
@@ -275,8 +286,54 @@ export function useConsole() {
     await queryDatabaseRecords(false)
   }
 
+  async function queryDatabaseCoverage({ table = coverageTable.value, year = coverageYear.value, month = coverageMonth.value, refresh = false } = {}) {
+    const targetTable = table || databaseTables.value[0]?.name || ''
+    if (!targetTable) {
+      coverageTable.value = ''
+      databaseCoverage.value = null
+      coverageError.value = ''
+      return
+    }
+    if (!refresh && databaseCoverage.value?.table?.name === targetTable && year === coverageYear.value && month === coverageMonth.value) return
+    const snapshotKey = `${targetTable}|${year ?? 'latest'}|${month ?? 'all'}`
+    const cachedSnapshot = !refresh ? coverageSnapshots.get(snapshotKey) : null
+    if (cachedSnapshot) {
+      coverageTable.value = targetTable
+      coverageYear.value = cachedSnapshot.selected_year
+      coverageMonth.value = cachedSnapshot.selected_month
+      databaseCoverage.value = cachedSnapshot
+      coverageError.value = ''
+      return
+    }
+    busy.value.coverage = true
+    coverageError.value = ''
+    try {
+      const result = await api.databaseCoverage({ table_name: targetTable, year, month })
+      coverageTable.value = targetTable
+      coverageYear.value = result.selected_year
+      coverageMonth.value = month
+      const previous = databaseCoverage.value?.table?.name === targetTable ? databaseCoverage.value : null
+      databaseCoverage.value = {
+        ...result,
+        total: result.total ?? previous?.total ?? 0,
+        min_year: result.min_year ?? previous?.min_year ?? null,
+        max_year: result.max_year ?? previous?.max_year ?? null,
+        years: result.years ?? previous?.years ?? [],
+      }
+      coverageSnapshots.set(snapshotKey, databaseCoverage.value)
+    } catch (error) {
+      coverageError.value = errorMessage(error)
+      databaseCoverage.value = null
+    } finally {
+      busy.value.coverage = false
+    }
+  }
+
   watch(section, (value) => {
     if (value === 'records' && !databaseRecords.value) queryDatabaseRecords()
+    if (value === 'coverage' && databaseCoverage.value?.table?.name !== (coverageTable.value || databaseTables.value[0]?.name)) {
+      queryDatabaseCoverage({ year: null, month: null, refresh: true })
+    }
   })
   async function bootstrap() {
     const results = await Promise.allSettled([
@@ -322,9 +379,10 @@ export function useConsole() {
 
   async function scanLocalArchives() {
     if (!localDirectory.value.trim()) {
-      showNotice('请填写本地月份目录或年度目录', 'error')
+      showNotice('请选择或填写 ZIP 所在文件夹', 'error')
       return
     }
+    // Infer the product from the selected path first to prevent cross-product merges.
     const details = directoryDetails()
     if (details.product && !databaseTables.value.some((table) => table.code === details.product)) {
       const message = `本地数据库中不存在 tick_data_${details.product}，请检查目录商品或数据库表配置`
@@ -340,8 +398,12 @@ export function useConsole() {
         scope: mergeScope.value,
         selected_month_directories: selectedMonthDirectories.value,
       })
+      // A year root in month mode returns month choices first; ZIPs are listed after that scope is narrowed.
       localArchives.value = result.archives || []
-      monthDirectories.value = result.month_directories || []
+      selectedLocalArchiveIds.value = localArchives.value.map((archive) => archive.id)
+      if (result.month_directories?.length || !selectedMonthDirectories.value.length) {
+        monthDirectories.value = result.month_directories || []
+      }
       scanMessage.value = result.message || ''
       await loadFiles()
       showNotice(result.message || `已发现 ${result.count} 个 ZIP 文件`, result.count || result.month_directories?.length ? 'success' : 'error')
@@ -354,18 +416,30 @@ export function useConsole() {
     }
   }
 
-  function appendEvent(event) {
-    if (!event || taskEvents.value.some((item) => item.id === event.id)) return
-    taskEvents.value = [...taskEvents.value, event]
+  async function pickLocalDirectory() {
+    busy.value.directory = true
+    try {
+      // The local backend opens the native Windows picker; selected ZIPs stay on disk.
+      const result = await api.pickLocalDirectory(localDirectory.value.trim() || localRootDirectory.value.trim())
+      if (!result.directory) return
+      localDirectory.value = result.directory
+      await nextTick()
+      await scanLocalArchives()
+    } catch (error) {
+      showNotice(errorMessage(error), 'error')
+    } finally {
+      busy.value.directory = false
+    }
   }
 
-  function applyEvent(taskId, event) {
+  function applyTaskEvent(taskId, event) {
     const current = tasks.value.find((task) => task.id === taskId) || { id: taskId }
     const update = {
       ...current,
       progress: event.progress,
       status: event.status,
       message: event.message,
+      last_event_id: event.id,
     }
     if (event.type === 'result') {
       update.result = event.data
@@ -379,24 +453,66 @@ export function useConsole() {
     const updated = upsertTask(update)
     if (selectedTask.value?.id === taskId) {
       selectedTask.value = { ...selectedTask.value, ...updated }
-      appendEvent(event)
+      if (event.type === 'result' || event.type === 'error') sseStatus.value = 'disconnected'
     }
     if (terminalStatuses.has(update.status)) {
       sources.get(taskId)?.close()
       sources.delete(taskId)
       loadFiles().catch(() => {})
       loadTasks().catch(() => {})
-      if (update.type === 'import' && databaseRecords.value) queryDatabaseRecords(false)
+      if (update.type === 'import') {
+        if (databaseRecords.value) queryDatabaseRecords(false)
+        if (section.value === 'coverage') queryDatabaseCoverage({ year: null, month: null, refresh: true })
+      }
     }
   }
 
+  function flushEvents() {
+    eventFlushTimer = null
+    for (const [taskId, events] of pendingEvents) {
+      pendingEvents.delete(taskId)
+      if (!events.length) continue
+      const latest = events.at(-1)
+      applyTaskEvent(taskId, latest)
+      if (selectedTask.value?.id !== taskId || hasNewerEvents.value) continue
+      const additions = events.filter((event) => {
+        if (eventIds.has(event.id)) return false
+        eventIds.add(event.id)
+        return true
+      })
+      if (additions.length) {
+        taskEvents.value = [...taskEvents.value, ...additions]
+        if (taskEvents.value.length > EVENT_PAGE_SIZE) {
+          taskEvents.value = taskEvents.value.slice(-EVENT_PAGE_SIZE)
+          hasOlderEvents.value = true
+          eventIds.clear()
+          taskEvents.value.forEach((event) => eventIds.add(event.id))
+        }
+      }
+    }
+  }
+
+  function queueEvent(taskId, event) {
+    if (!event || event.id === undefined) return
+    const events = pendingEvents.get(taskId) || []
+    events.push(event)
+    pendingEvents.set(taskId, events)
+    if (eventFlushTimer === null) eventFlushTimer = setTimeout(flushEvents, 100)
+  }
+
   function connectTask(task, cursor = 0) {
-    if (!task?.id || terminalStatuses.has(task.status) || sources.has(task.id)) return
+    if (!task?.id || terminalStatuses.has(task.status)) return
+    if (sources.has(task.id)) {
+      if (selectedTask.value?.id === task.id) {
+        sseStatus.value = sources.get(task.id).readyState === EventSource.OPEN ? 'connected' : 'reconnecting'
+      }
+      return
+    }
     const source = new EventSource(api.eventsUrl(task.id, cursor))
     const handle = (browserEvent) => {
       if (!browserEvent.data) return
       try {
-        applyEvent(task.id, JSON.parse(browserEvent.data))
+        queueEvent(task.id, JSON.parse(browserEvent.data))
       } catch {
         showNotice('收到无法解析的任务事件', 'error')
       }
@@ -404,26 +520,106 @@ export function useConsole() {
     ;['status', 'log', 'progress', 'result', 'error'].forEach((name) => {
       source.addEventListener(name, handle)
     })
+    source.onopen = () => {
+      if (selectedTask.value?.id === task.id) sseStatus.value = 'connected'
+    }
     source.onerror = () => {
+      if (selectedTask.value?.id === task.id) sseStatus.value = 'reconnecting'
       const latest = tasks.value.find((item) => item.id === task.id)
       if (latest && terminalStatuses.has(latest.status)) {
         source.close()
         sources.delete(task.id)
+        if (selectedTask.value?.id === task.id) sseStatus.value = 'disconnected'
       }
     }
     sources.set(task.id, source)
+  }
+
+  async function setTaskPaused(task, shouldPause) {
+    try {
+      const updated = shouldPause ? await api.pauseTask(task.id) : await api.resumeTask(task.id)
+      upsertTask(updated)
+      if (selectedTask.value?.id === task.id) selectedTask.value = { ...selectedTask.value, ...updated }
+      connectTask(updated, taskEvents.value.at(-1)?.id || 0)
+    } catch (error) {
+      showNotice(errorMessage(error), 'error')
+    }
   }
 
   async function selectTask(task) {
     try {
       const detail = await api.task(task.id)
       selectedTask.value = detail
-      taskEvents.value = detail.events || []
+      hasNewerEvents.value = false
+      eventHistoryBusy.value = true
+      sseStatus.value = terminalStatuses.has(detail.status) ? 'disconnected' : 'connecting'
       section.value = 'logs'
-      const cursor = taskEvents.value.at(-1)?.id || 0
-      connectTask(detail, cursor)
+      const page = await api.taskEvents(task.id, { limit: EVENT_PAGE_SIZE })
+      if (selectedTask.value?.id !== task.id) return
+      taskEvents.value = page.events || []
+      hasOlderEvents.value = page.has_more
+      eventIds.clear()
+      taskEvents.value.forEach((event) => eventIds.add(event.id))
+      connectTask(detail, detail.last_event_id || 0)
     } catch (error) {
       showNotice(errorMessage(error), 'error')
+    } finally {
+      eventHistoryBusy.value = false
+    }
+  }
+
+  function clearSelectedTask() {
+    selectedTask.value = null
+    taskEvents.value = []
+    hasOlderEvents.value = false
+    hasNewerEvents.value = false
+    eventHistoryBusy.value = false
+    sseStatus.value = 'disconnected'
+  }
+
+  async function loadOlderEvents() {
+    if (!selectedTask.value || eventHistoryBusy.value || !hasOlderEvents.value || !taskEvents.value.length) return
+    eventHistoryBusy.value = true
+    try {
+      const page = await api.taskEvents(selectedTask.value.id, {
+        before_id: taskEvents.value[0].id,
+        limit: EVENT_PAGE_SIZE,
+      })
+      const additions = page.events.filter((event) => !eventIds.has(event.id))
+      additions.forEach((event) => eventIds.add(event.id))
+      taskEvents.value = [...additions, ...taskEvents.value]
+      hasOlderEvents.value = page.has_more
+      hasNewerEvents.value = taskEvents.value.at(-1)?.id < (selectedTask.value.last_event_id || 0)
+    } catch (error) {
+      showNotice(errorMessage(error), 'error')
+    } finally {
+      eventHistoryBusy.value = false
+    }
+  }
+
+  async function loadNewerEvents() {
+    if (!selectedTask.value || eventHistoryBusy.value) return
+    eventHistoryBusy.value = true
+    try {
+      const page = await api.taskEvents(
+        selectedTask.value.id,
+        hasNewerEvents.value && taskEvents.value.length
+          ? { after_id: taskEvents.value.at(-1).id, limit: EVENT_PAGE_SIZE }
+          : { limit: EVENT_PAGE_SIZE },
+      )
+      taskEvents.value = page.events || []
+      hasNewerEvents.value = page.has_more
+      hasOlderEvents.value = page.has_more || taskEvents.value[0]?.id > 1
+      eventIds.clear()
+      taskEvents.value.forEach((event) => eventIds.add(event.id))
+      if (selectedTask.value) selectedTask.value.last_event_id = Math.max(
+        selectedTask.value.last_event_id || 0,
+        taskEvents.value.at(-1)?.id || 0,
+      )
+    } catch (error) {
+      showNotice(errorMessage(error), 'error')
+    } finally {
+      eventHistoryBusy.value = false
     }
   }
 
@@ -447,8 +643,18 @@ export function useConsole() {
   }
 
   function startExtract() {
-    if (!localDirectory.value.trim() && !selectedZipIds.value.length) {
+    // Scanned local IDs preserve the user's exact ZIP selection instead of rescanning the whole folder.
+    if (tasks.value.some((task) => task.type === 'extract' && ['pending', 'running', 'pausing', 'paused'].includes(task.status))) {
+      showNotice('已有 ZIP 合并任务尚未结束，请先在运行日志中查看或继续该任务', 'error')
+      return
+    }
+    const archiveIds = localArchives.value.length ? selectedLocalArchiveIds.value : selectedZipIds.value
+    if (!localDirectory.value.trim() && !archiveIds.length) {
       showNotice('请先选择 ZIP 文件', 'error')
+      return
+    }
+    if (localArchives.value.length && !archiveIds.length) {
+      showNotice('请至少勾选一个 ZIP 文件', 'error')
       return
     }
     if (!targetProduct.value) {
@@ -456,12 +662,12 @@ export function useConsole() {
       return
     }
     createTask('extract', {
-      file_ids: localDirectory.value.trim() ? [] : selectedZipIds.value,
+      file_ids: archiveIds,
       output_name: outputName.value || null,
       target_product: targetProduct.value.trim() || null,
-      source_directory: localDirectory.value.trim() || null,
+      source_directory: localArchives.value.length ? null : (localDirectory.value.trim() || null),
       merge_scope: mergeScope.value,
-       selected_month_directories: selectedMonthDirectories.value,
+      selected_month_directories: selectedMonthDirectories.value,
     })
   }
 
@@ -526,88 +732,28 @@ export function useConsole() {
     }
   }
 
-  async function openLocalDirectory(path = localRootDirectory.value.trim(), rememberRoot = true) {
-    if (!path) {
-      showNotice('请先填写本地根目录路径', 'error')
-      return
-    }
-    busy.value.directory = true
-    try {
-      const result = await api.localDirectories(path)
-      if (rememberRoot) {
-        localRootDirectory.value = path
-        localBrowserRootPath.value = result.directory
-        if (typeof window !== 'undefined') window.localStorage.setItem('tick-data-console.local-browser-root', result.directory)
-      }
-      localBrowserPath.value = result.directory
-      localBrowserLastPath.value = result.directory
-      localBrowserDirectories.value = result.directories || []
-      if (typeof window !== 'undefined') window.localStorage.setItem('tick-data-console.local-browser-path', result.directory)
-      localBrowserOpen.value = true
-      localDirectoryMenuOpen.value = false
-      if (rememberRoot && typeof window !== 'undefined') window.localStorage.setItem('tick-data-console.local-root', path)
-    } catch (error) {
-      showNotice(`目录读取失败：${errorMessage(error)}`, 'error')
-    } finally {
-      busy.value.directory = false
-    }
-  }
-
-  function sameDirectory(left, right) {
-    return left.trim().replace(/[\\/]+$/, '').toLowerCase() === right.trim().replace(/[\\/]+$/, '').toLowerCase()
-  }
-
-  async function reopenLocalDirectory() {
-    const configuredRoot = localRootDirectory.value.trim()
-    const canResume = configuredRoot && localBrowserLastPath.value && localBrowserRootPath.value && sameDirectory(configuredRoot, localBrowserRootPath.value)
-    const path = canResume ? localBrowserLastPath.value : configuredRoot
-    await openLocalDirectory(path, !canResume)
-  }
-
-  async function browseLocalDirectory(path) {
-    if (!path) return
-    localDirectoryMenuOpen.value = false
-    await openLocalDirectory(path, false)
-  }
-
-  function parentDirectory(path) {
-    const normalized = path.replace(/[\\/]+$/, '')
-    const separator = Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/'))
-    return separator > 2 ? normalized.slice(0, separator) : normalized
-  }
-
-  async function browseLocalDirectoryUp() {
-    if (!localBrowserPath.value || localBrowserPath.value === localBrowserRootPath.value) return
-    await browseLocalDirectory(parentDirectory(localBrowserPath.value))
-  }
-
-  function toggleLocalDirectoryMenu() {
-    if (localBrowserDirectories.value.length) {
-      localDirectoryMenuOpen.value = !localDirectoryMenuOpen.value
-    }
-  }
-
-  function useLocalBrowserDirectory() {
-    if (!localBrowserPath.value) return
-    localDirectory.value = localBrowserPath.value
-    localDirectoryMenuOpen.value = false
-    if (typeof window !== 'undefined') window.localStorage.setItem('tick-data-console.local-directory', localDirectory.value)
-    localBrowserOpen.value = false
-    showNotice('已选择本地目录')
-  }
-
-  function closeLocalDirectoryBrowser() {
-    localBrowserOpen.value = false
-    localDirectoryMenuOpen.value = false
-  }
-
   function toggleZip(fileId) {
     selectedZipIds.value = selectedZipIds.value.includes(fileId)
       ? selectedZipIds.value.filter((id) => id !== fileId)
       : [...selectedZipIds.value, fileId]
   }
 
+  function toggleLocalArchive(fileId) {
+    selectedLocalArchiveIds.value = selectedLocalArchiveIds.value.includes(fileId)
+      ? selectedLocalArchiveIds.value.filter((id) => id !== fileId)
+      : [...selectedLocalArchiveIds.value, fileId]
+  }
+
+  function selectAllLocalArchives() {
+    selectedLocalArchiveIds.value = localArchives.value.map((archive) => archive.id)
+  }
+
+  function clearSelectedLocalArchives() {
+    selectedLocalArchiveIds.value = []
+  }
+
   function toggleMonthDirectory(directory) {
+    // A changed month scope invalidates the previous ZIP list until the next scan.
     selectedMonthDirectories.value = selectedMonthDirectories.value.includes(directory)
       ? selectedMonthDirectories.value.filter((item) => item !== directory)
       : [...selectedMonthDirectories.value, directory]
@@ -616,9 +762,24 @@ export function useConsole() {
     refreshDerivedFields()
   }
 
+  function selectAllMonthDirectories() {
+    selectedMonthDirectories.value = [...monthDirectories.value]
+    localArchives.value = []
+    scanMessage.value = ''
+    refreshDerivedFields()
+  }
+
+  function clearSelectedMonthDirectories() {
+    selectedMonthDirectories.value = []
+    localArchives.value = []
+    scanMessage.value = ''
+    refreshDerivedFields()
+  }
+
   onMounted(bootstrap)
   onBeforeUnmount(() => {
     sources.forEach((source) => source.close())
+    clearTimeout(eventFlushTimer)
     clearTimeout(noticeTimer)
   })
 
@@ -632,15 +793,9 @@ export function useConsole() {
     dataFiles,
     selectedZipIds,
     localDirectory,
-    localRootDirectory,
-    localBrowserPath,
-    localBrowserRootPath,
-    localBrowserLastPath,
-    localBrowserDirectories,
-    localBrowserOpen,
-    localDirectoryMenuOpen,
     mergeScope,
     localArchives,
+    selectedLocalArchiveIds,
     monthDirectories,
     selectedMonthDirectories,
     scanMessage,
@@ -655,6 +810,12 @@ export function useConsole() {
     adjustDuplicates,
     selectedTask,
     taskEvents,
+    hasOlderEvents,
+    hasNewerEvents,
+    eventHistoryBusy,
+    sseStatus,
+    loadOlderEvents,
+    loadNewerEvents,
     runningTasks,
     successfulTasks,
     failedTasks,
@@ -665,6 +826,11 @@ export function useConsole() {
     databaseTablesError,
     databaseRecords,
     databaseQuery,
+    coverageTable,
+    coverageYear,
+    coverageMonth,
+    databaseCoverage,
+    coverageError,
     tableOptions,
     selectedFileProduct,
     matchingTable,
@@ -678,23 +844,25 @@ export function useConsole() {
     cancelClearHistory,
     clearHistory,
     scanLocalArchives,
-    openLocalDirectory,
-    reopenLocalDirectory,
-    browseLocalDirectory,
-    browseLocalDirectoryUp,
-    toggleLocalDirectoryMenu,
-    useLocalBrowserDirectory,
-    closeLocalDirectoryBrowser,
+    pickLocalDirectory,
     toggleZip,
+    toggleLocalArchive,
+    selectAllLocalArchives,
+    clearSelectedLocalArchives,
     toggleMonthDirectory,
+    selectAllMonthDirectories,
+    clearSelectedMonthDirectories,
     startExtract,
+    setTaskPaused,
     startValidate,
     startImport,
     testDatabase,
     saveDatabase,
     selectTask,
+    clearSelectedTask,
     loadFiles,
     queryDatabaseRecords,
     clearDatabaseQuery,
+    queryDatabaseCoverage,
   }
 }

@@ -4,18 +4,22 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from typing import BinaryIO
 
 from .config import ARTIFACT_DIR, EXTRACT_DIR, FILE_INDEX, UPLOAD_DIR, ensure_data_dirs
 
 
 SAFE_NAME_RE = re.compile(r"[^\w.\-()\u4e00-\u9fff]+", re.UNICODE)
+PREVIEW_INDEX_STRIDE = 10_000
+PREVIEW_READ_SIZE = 4 * 1024 * 1024
 
 
 class FileStore:
     def __init__(self) -> None:
         self._lock = RLock()
+        self._preview_lock = RLock()
+        self._preview_jobs = {}
         ensure_data_dirs()
         self._files = self._load()
 
@@ -102,6 +106,153 @@ class FileStore:
             if not path.exists():
                 raise FileNotFoundError(path)
             return {**item, "resolved_path": path}
+
+    def _preview_artifact(self, file_id: str) -> dict:
+        item = self.get(file_id)
+        path = item["resolved_path"]
+        artifact_root = ARTIFACT_DIR.resolve()
+        if item.get("kind") != "artifact" or artifact_root not in path.parents:
+            raise ValueError("只能预览项目生成的合并日志文件")
+        if item.get("extension") not in {".txt", ".log"}:
+            raise ValueError("仅支持预览 TXT 或 LOG 文件")
+        return item
+
+    @staticmethod
+    def _index_path(item: dict) -> Path:
+        index_directory = FILE_INDEX.parent / "preview_indexes"
+        index_directory.mkdir(parents=True, exist_ok=True)
+        return index_directory / f"{item['id']}.json"
+
+    def _load_preview_index(self, item: dict) -> dict | None:
+        index_path = self._index_path(item)
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        stat = item["resolved_path"].stat()
+        if index.get("size") != stat.st_size or index.get("mtime_ns") != stat.st_mtime_ns:
+            return None
+        return index
+
+    def preview_index_status(self, file_id: str) -> dict:
+        item = self._preview_artifact(file_id)
+        index = self._load_preview_index(item)
+        if index:
+            return {"status": "ready", "progress": 100, "total_lines": index["total_lines"]}
+        with self._preview_lock:
+            job = self._preview_jobs.get(file_id)
+            if job and job["status"] == "indexing":
+                return {"status": "indexing", "progress": job["progress"], "total_lines": None}
+            if job and job["status"] == "failed":
+                return {"status": "failed", "progress": job["progress"], "total_lines": None, "error": job["error"]}
+            job = {"status": "indexing", "progress": 0, "total_lines": None, "error": None}
+            self._preview_jobs[file_id] = job
+        Thread(target=self._build_preview_index, args=(file_id, item, job), daemon=True).start()
+        return {"status": "indexing", "progress": 0, "total_lines": None}
+
+    def _build_preview_index(self, file_id: str, item: dict, job: dict) -> None:
+        path = item["resolved_path"]
+        stat = path.stat()
+        offsets = [0]
+        newline_count = 0
+        next_checkpoint = PREVIEW_INDEX_STRIDE
+        last_byte = b""
+        try:
+            with path.open("rb") as source:
+                while chunk := source.read(PREVIEW_READ_SIZE):
+                    chunk_start = source.tell() - len(chunk)
+                    newline_total = chunk.count(b"\n")
+                    while newline_count + newline_total >= next_checkpoint:
+                        remaining = next_checkpoint - newline_count
+                        position = -1
+                        for _ in range(remaining):
+                            position = chunk.find(b"\n", position + 1)
+                        offsets.append(chunk_start + position + 1)
+                        next_checkpoint += PREVIEW_INDEX_STRIDE
+                    newline_count += newline_total
+                    last_byte = chunk[-1:]
+                    with self._preview_lock:
+                        job["progress"] = min(99, int(source.tell() * 100 / max(stat.st_size, 1)))
+            total_lines = newline_count + (1 if stat.st_size and last_byte != b"\n" else 0)
+            index = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "total_lines": total_lines,
+                "stride": PREVIEW_INDEX_STRIDE,
+                "offsets": offsets,
+            }
+            index_path = self._index_path(item)
+            temporary = index_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(index), encoding="utf-8")
+            temporary.replace(index_path)
+            with self._preview_lock:
+                job.update(status="ready", progress=100, total_lines=total_lines)
+        except Exception as exc:
+            with self._preview_lock:
+                job.update(status="failed", error=str(exc))
+
+    def read_artifact_preview(self, file_id: str, offset: int = 0, limit: int = 100, line: int | None = None) -> dict:
+        item = self._preview_artifact(file_id)
+        path = item["resolved_path"]
+        if offset < 0 or offset > item["size"]:
+            raise ValueError("预览位置超出文件范围")
+
+        index = self._load_preview_index(item)
+        index_status = self.preview_index_status(file_id) if not index else {
+            "status": "ready", "progress": 100, "total_lines": index["total_lines"]
+        }
+        start_line = None
+        if line is not None:
+            if line < 1:
+                raise ValueError("行号必须大于或等于 1")
+            if not index:
+                if index_status["status"] == "failed":
+                    raise ValueError("行号索引建立失败")
+                if line > 1:
+                    return {"lines": [], "indexing": True, **index_status, "size": item["size"]}
+                start_line = 1
+            elif line > index["total_lines"]:
+                raise ValueError(f"行号超出范围，文件共 {index['total_lines']} 行")
+            else:
+                start_line = line
+                checkpoint = (line - 1) // index["stride"]
+                offset = index["offsets"][checkpoint]
+                line = (line - 1) % index["stride"] + 1
+
+        lines = []
+        with path.open("rb") as source:
+            if offset:
+                source.seek(offset - 1)
+                if source.read(1) != b"\n":
+                    source.readline()
+            else:
+                source.seek(0)
+            start_offset = source.tell()
+            if line is not None:
+                for _ in range(line - 1):
+                    if not source.readline():
+                        break
+                start_offset = source.tell()
+            for _ in range(limit):
+                raw_line = source.readline(16 * 1024 * 1024)
+                if not raw_line:
+                    break
+                lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\r\n"))
+            next_offset = source.tell()
+            has_more = source.read(1) != b""
+        if start_line is None and index:
+            start_line = (index["offsets"].index(start_offset) * index["stride"] + 1) if start_offset in index["offsets"] else None
+        return {
+            "lines": lines,
+            "offset": start_offset,
+            "next_offset": next_offset,
+            "has_more": has_more,
+            "size": item["size"],
+            "indexing": not bool(index),
+            "total_lines": index["total_lines"] if index else None,
+            "start_line": start_line,
+            "index_progress": index_status["progress"],
+        }
 
     def list(self) -> list[dict]:
         with self._lock:

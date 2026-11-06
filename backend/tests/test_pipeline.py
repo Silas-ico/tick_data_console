@@ -1,14 +1,17 @@
 import io
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from app import storage, task_manager
 from app.services import archive_service
 from app.services.archive_service import _default_output_name, _source_files, build_extract_worker
-from app.services.tick_service import build_validate_worker, infer_product_from_file
+from app.services.tick_service import build_import_worker, build_validate_worker, infer_product_from_file, query_tick_coverage
 
 
 class PipelineTest(unittest.TestCase):
@@ -65,6 +68,7 @@ class PipelineTest(unittest.TestCase):
         extract_result = self.wait_for_task(self.tasks, extract_task["id"])
         self.assertEqual(extract_result["status"], "success", extract_result.get("error"))
         self.assertEqual(extract_result["result"]["written_lines"], 2)
+        self.assertEqual(extract_result["result"]["artifact"]["name"], "merged_log.txt")
         self.assertTrue(any(event["type"] == "progress" for event in extract_result["events"]))
 
         artifact_id = extract_result["result"]["artifact"]["id"]
@@ -96,6 +100,250 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(upload_result["upload_records"], 1)
         self.assertFalse((storage.UPLOAD_DIR / f"{upload['id']}_sample.zip").exists())
         self.assertEqual(self.file_store.get(artifact["id"])["kind"], "artifact")
+
+    def test_artifact_preview_reads_utf8_in_bounded_pages(self):
+        path = storage.ARTIFACT_DIR / "preview.txt"
+        path.write_text("第一行\n第二行\n第三行\n", encoding="utf-8")
+        artifact = self.file_store.register_artifact("preview.txt", path)
+
+        first = self.file_store.read_artifact_preview(artifact["id"], limit=2)
+        second = self.file_store.read_artifact_preview(artifact["id"], offset=first["next_offset"], limit=2)
+
+        self.assertEqual(first["lines"], ["第一行", "第二行"])
+        self.assertTrue(first["has_more"])
+        self.assertEqual(second["lines"], ["第三行"])
+        self.assertFalse(second["has_more"])
+        for _ in range(100):
+            if self.file_store.preview_index_status(artifact["id"])["status"] == "ready":
+                break
+            time.sleep(0.01)
+
+    def test_artifact_preview_rejects_local_files(self):
+        path = Path(self.temporary.name) / "source.txt"
+        path.write_text("source", encoding="utf-8")
+        local_file = self.file_store.register_local_path(path)
+
+        with self.assertRaisesRegex(ValueError, "只能预览"):
+            self.file_store.read_artifact_preview(local_file["id"])
+
+    def test_artifact_preview_index_counts_and_jumps_to_line(self):
+        path = storage.ARTIFACT_DIR / "indexed-preview.txt"
+        path.write_text("\n".join(f"行 {number}" for number in range(1, 26)), encoding="utf-8")
+        artifact = self.file_store.register_artifact("indexed-preview.txt", path)
+
+        first = self.file_store.read_artifact_preview(artifact["id"], line=1, limit=3)
+        self.assertEqual(first["lines"], ["行 1", "行 2", "行 3"])
+        for _ in range(100):
+            status = self.file_store.preview_index_status(artifact["id"])
+            if status["status"] == "ready":
+                break
+            time.sleep(0.01)
+        self.assertEqual(status["total_lines"], 25)
+
+        jumped = self.file_store.read_artifact_preview(artifact["id"], line=21, limit=3)
+        self.assertEqual(jumped["start_line"], 21)
+        self.assertEqual(jumped["lines"], ["行 21", "行 22", "行 23"])
+        self.assertTrue(jumped["has_more"])
+
+    def test_progress_events_are_throttled_and_stored_incrementally(self):
+        release_worker = threading.Event()
+        task = self.tasks.create(
+            "validate", {}, lambda _context, _payload: release_worker.wait(timeout=2) or {}
+        )
+        task_id = task["id"]
+        self.tasks.update_progress(task_id, 1, "检查 500 行")
+        self.tasks.update_progress(task_id, 1.01, "检查 1000 行")
+
+        snapshot = self.tasks.snapshot(task_id, include_events=True)
+        persisted = (task_manager.TASK_DIR / f"{task_id}.json").read_text(encoding="utf-8")
+        event_lines = (task_manager.TASK_DIR / f"{task_id}.events.jsonl").read_text(encoding="utf-8").splitlines()
+        try:
+            self.assertEqual(snapshot["progress"], 1.01)
+            self.assertEqual(sum(event["type"] == "progress" for event in snapshot["events"]), 1)
+            self.assertNotIn('"events"', persisted)
+            self.assertGreaterEqual(len(event_lines), 3)
+        finally:
+            release_worker.set()
+            self.wait_for_task(self.tasks, task_id)
+
+    def test_task_event_history_is_cursor_paginated(self):
+        task = self.tasks.create("noop", {}, lambda _context, _payload: {})
+        self.wait_for_task(self.tasks, task["id"])
+        for index in range(7):
+            self.tasks.emit(task["id"], "log", f"event {index}")
+
+        latest = self.tasks.event_page(task["id"], limit=4)
+        older = self.tasks.event_page(task["id"], before_id=latest["events"][0]["id"], limit=4)
+        newer = self.tasks.event_page(task["id"], after_id=older["events"][-1]["id"], limit=4)
+
+        self.assertEqual(len(latest["events"]), 4)
+        self.assertTrue(latest["has_more"])
+        self.assertEqual(older["events"][-1]["id"] + 1, latest["events"][0]["id"])
+        self.assertEqual(newer["events"], latest["events"])
+
+    def test_task_events_survive_manager_reload(self):
+        task = self.tasks.create("noop", {}, lambda _context, _payload: {})
+        finished = self.wait_for_task(self.tasks, task["id"])
+
+        reloaded = task_manager.TaskManager()
+        restored = reloaded.snapshot(task["id"], include_events=True)
+
+        self.assertEqual(restored["status"], "success")
+        self.assertEqual(restored["events"], finished["events"])
+
+    def test_task_pause_resume_waits_at_checkpoint(self):
+        first_archive_started = threading.Event()
+        finish_first_archive = threading.Event()
+        second_archive_started = threading.Event()
+
+        def worker(context, payload):
+            context.wait_if_paused()
+            first_archive_started.set()
+            finish_first_archive.wait(timeout=2)
+            context.checkpoint(completed_archives=1)
+            context.wait_if_paused()
+            second_archive_started.set()
+            return {"completed_archives": 2}
+
+        task = self.tasks.create("extract", {}, worker)
+        self.assertTrue(first_archive_started.wait(timeout=1))
+        paused = self.tasks.pause(task["id"])
+        self.assertEqual(paused["status"], "pausing")
+        finish_first_archive.set()
+
+        for _ in range(100):
+            snapshot = self.tasks.snapshot(task["id"])
+            if snapshot["status"] == "paused":
+                break
+            time.sleep(0.01)
+        self.assertEqual(snapshot["status"], "paused")
+        self.assertEqual(snapshot["checkpoint"]["completed_archives"], 1)
+        self.assertFalse(second_archive_started.is_set())
+
+        self.tasks.resume(task["id"])
+        result = self.wait_for_task(self.tasks, task["id"])
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(second_archive_started.is_set())
+
+    def test_database_coverage_reports_real_year_month_and_day_gaps(self):
+        class Cursor:
+            def __init__(self):
+                self.result = None
+                self.rows = []
+                self.sql = ""
+                self.period_query_count = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params=None):
+                self.sql = sql
+                if "information_schema.statistics" in sql:
+                    self.result = {"total": 1}
+                elif "SELECT COUNT(*) AS total FROM `tick_data_A`" in sql:
+                    if _params == (datetime(2024, 1, 1).date(), datetime(2025, 1, 1).date()):
+                        self.result = {"total": 30}
+                    else:
+                        self.period_query_count += 1
+                        self.result = {"total": [3, 8, 20][(self.period_query_count - 1) % 3]}
+                elif "MIN(`tick_time`)" in sql:
+                    self.result = {"min_time": datetime(2021, 1, 1), "max_time": datetime(2024, 3, 1)}
+                elif "GROUP BY MONTH" in sql:
+                    self.rows = [{"month": 1, "total": 10}, {"month": 3, "total": 20}]
+                elif "GROUP BY DAY" in sql:
+                    self.rows = [{"day": 2, "total": 10}, {"day": 4, "total": 10}]
+                else:
+                    self.rows = []
+
+            def fetchone(self):
+                return self.result
+
+            def fetchall(self):
+                return self.rows
+
+        class Connection:
+            def cursor(self):
+                return Cursor()
+
+            def close(self):
+                pass
+
+        config = {"database": "test"}
+        with patch("app.services.tick_service.list_tick_tables", return_value=[
+            {"name": "tick_data_A", "code": "A", "label": "A"},
+        ]), patch("app.services.tick_service.connect_database", return_value=Connection()), \
+                patch("app.services.tick_service._persist_coverage_cache"), \
+                patch.dict("app.services.tick_service._coverage_year_cache", {}, clear=True):
+            result = query_tick_coverage(config, table_name="tick_data_A", month=3)
+            detail_result = query_tick_coverage(config, table_name="tick_data_A", year=2024, month=3)
+
+        self.assertEqual([item["year"] for item in result["years"]], [2024, 2023, 2022, 2021])
+        self.assertEqual([item["month"] for item in result["months"]], [1, 3])
+        self.assertEqual([item["day"] for item in result["days"]], [2, 4])
+        self.assertEqual(result["periods"], {"day": 3, "week": 8, "month": 20, "year": 0})
+        self.assertIsNone(detail_result["years"])
+        self.assertEqual(detail_result["selected_year_total"], 30)
+
+    def test_import_result_and_log_record_file_months(self):
+        source = Path(self.temporary.name) / "A_sample.txt"
+        source.write_text("\n".join([
+            'TICK_DATA:{code:"A2305.XDCE",underlying_symbol:"A",datetime:"2021-01-01 09:30:00",current:1}',
+            'TICK_DATA:{code:"A2305.XDCE",underlying_symbol:"A",datetime:"2023-02-01 09:30:00",current:2}',
+        ]), encoding="utf-8")
+        file_item = self.file_store.register_local_path(source)
+
+        class Cursor:
+            rowcount = 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params=None):
+                self.sql = sql
+
+            def fetchone(self):
+                return {"count": 2, "min_time": "2021-01-01", "max_time": "2023-02-01"}
+
+        class Connection:
+            def cursor(self):
+                return Cursor()
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        class Context:
+            def __init__(self):
+                self.messages = []
+
+            def log(self, message):
+                self.messages.append(message)
+
+            def progress(self, *_args):
+                pass
+
+        context = Context()
+        with patch("app.services.tick_service.ensure_database"), \
+                patch("app.services.tick_service.connect_database", return_value=Connection()), \
+                patch("app.services.tick_service.table_exists", return_value=True):
+            result = build_import_worker(self.file_store, lambda: {
+                "host": "localhost", "port": 3306, "database": "test",
+            })(context, {"file_id": file_item["id"], "table_name": "tick_data_A"})
+
+        self.assertEqual(result["file_months"], ["2021-01", "2023-02"])
+        self.assertEqual(result["file_month_range"], {"start": "2021-01", "end": "2023-02"})
+        self.assertTrue(any("2021年1月、2023年2月" in message for message in context.messages))
 
     def test_extract_filters_mixed_products(self):
         log_text = "\n".join([
@@ -137,6 +385,13 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("C2303.XDCE", rejected_text)
         self.assertEqual(infer_product_from_file(clean_file, "utf-8"), "A")
 
+    def test_archive_month_directory_identifies_year_subfolder(self):
+        root = Path(self.temporary.name) / "BU" / "2022"
+        archive_path = root / "10月" / "nested" / "log-0105.zip"
+        self.assertEqual(archive_service.archive_month_directory(archive_path, root), "10月")
+        self.assertEqual(archive_service.archive_month_directory(archive_path, root / "10月"), "10月")
+        self.assertIsNone(archive_service.archive_month_directory(root / "log-0105.zip", root))
+
     def test_extract_reads_local_month_and_year_directories(self):
         root = Path(self.temporary.name) / "A" / "2023"
         month_one = root / "10月"
@@ -156,6 +411,18 @@ class PipelineTest(unittest.TestCase):
         write_zip(month_one, "A_10.zip", 1)
         write_zip(month_two, "A_11.zip", 2)
 
+        ordered_paths = sorted(
+            [
+                root / "10月" / "nested" / "A_10.zip",
+                root / "2月" / "A_02.zip",
+                root / "1月" / "A_01.zip",
+            ],
+            key=archive_service._archive_sort_key,
+        )
+        self.assertEqual([archive_service._archive_period_label(path) for path in ordered_paths], [
+            "2023年1月", "2023年2月", "2023年10月",
+        ])
+
         month_files = self.file_store.list()
         self.assertEqual(month_files, [])
 
@@ -174,6 +441,9 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result["status"], "success", result.get("error"))
         self.assertEqual(result["result"]["zip_files"], 2)
         self.assertEqual(result["result"]["written_lines"], 2)
+        extract_messages = [event["message"] for event in result["events"] if event["type"] == "log"]
+        self.assertTrue(any("2023年10月" in message for message in extract_messages))
+        self.assertTrue(any("2023年11月" in message for message in extract_messages))
 
         month_task = self.tasks.create(
             "extract",

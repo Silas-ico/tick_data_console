@@ -1,25 +1,153 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { api } from './api'
 import { useConsole } from './useConsole'
 
 const consoleState = useConsole()
 const {
-  section, serverOnline, fileStats, tasks, zipFiles, dataFiles, selectedZipIds,
-  localDirectory, localRootDirectory, localBrowserPath, localBrowserRootPath, localBrowserDirectories, localBrowserOpen, localDirectoryMenuOpen, mergeScope, localArchives, monthDirectories, selectedMonthDirectories, scanMessage, selectedDataFileId, outputNamePrefix, outputNameSuffix, targetProduct, tableName, databaseTables, databaseTablesError, selectedFileProduct, matchingTable, importTargetInvalid, targetProductLocked, tableNameLocked, tableOptions, adjustDuplicates, selectedTask,
-  taskEvents, runningTasks, successfulTasks, failedTasks, latestValidation,
-  latestImport, database, busy, notice, databaseRecords, databaseQuery, cleanupConfirmOpen, requestClearHistory, cancelClearHistory, clearHistory, scanLocalArchives, openLocalDirectory, reopenLocalDirectory, browseLocalDirectory, browseLocalDirectoryUp, toggleLocalDirectoryMenu, useLocalBrowserDirectory, closeLocalDirectoryBrowser, toggleMonthDirectory, setOutputNameManually, toggleZip, startExtract,
-  startValidate, startImport, testDatabase, saveDatabase, selectTask, queryDatabaseRecords, clearDatabaseQuery,
+  section, serverOnline, files, fileStats, tasks, zipFiles, dataFiles, selectedZipIds,
+  localDirectory, mergeScope, localArchives, selectedLocalArchiveIds, monthDirectories, selectedMonthDirectories, scanMessage, selectedDataFileId, outputNamePrefix, outputNameSuffix, targetProduct, tableName, databaseTables, databaseTablesError, selectedFileProduct, matchingTable, importTargetInvalid, targetProductLocked, tableNameLocked, tableOptions, adjustDuplicates, selectedTask,
+  taskEvents, hasOlderEvents, hasNewerEvents, eventHistoryBusy, sseStatus, loadOlderEvents, loadNewerEvents,
+  runningTasks, successfulTasks, failedTasks, latestValidation, setTaskPaused, selectAllMonthDirectories, clearSelectedMonthDirectories,
+  latestImport, database, busy, notice, databaseRecords, databaseQuery, coverageTable, coverageYear, coverageMonth, databaseCoverage, coverageError, queryDatabaseCoverage, cleanupConfirmOpen, requestClearHistory, cancelClearHistory, clearHistory, scanLocalArchives, pickLocalDirectory, toggleMonthDirectory, setOutputNameManually, toggleZip, toggleLocalArchive, selectAllLocalArchives, clearSelectedLocalArchives, startExtract,
+  startValidate, startImport, testDatabase, saveDatabase, selectTask, clearSelectedTask, queryDatabaseRecords, clearDatabaseQuery,
 } = consoleState
 
 const directoryName = (directory) => directory.split(/[\\/]/).filter(Boolean).at(-1) || directory
 const terminalBody = ref(null)
 const recordsPanel = ref(null)
 const pageJump = ref(1)
+const taskFilter = ref('all')
 const calendarPicker = ref(null)
 const calendarOpen = ref(false)
 const calendarField = ref('start_time')
 const calendarCursor = ref(new Date(new Date().getFullYear(), new Date().getMonth(), 1))
 let followTerminalLogs = true
+const previewFileId = ref('')
+const previewKeyword = ref('')
+const previewBusy = ref(false)
+const previewError = ref('')
+const previewResult = ref(null)
+const previewStartLine = ref(1)
+const previewJumpLine = ref(1)
+const previewPages = ref([1])
+const previewIndexStatus = ref('idle')
+const previewIndexProgress = ref(0)
+let previewIndexTimer = null
+let previewRequestLine = 1
+function previewCodeParts(line) {
+  const parts = []
+  const timestamp = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)/.exec(line)
+  let source = line
+  if (timestamp) {
+    parts.push({ text: timestamp[0], tone: 'timestamp' })
+    source = line.slice(timestamp[0].length)
+  }
+  const tokenPattern = /TICK_DATA:|\b(?:INFO|WARNING|ERROR|DEBUG)\b|"(?:\\.|[^"\\])*"(?=\s*:)|"(?:\\.|[^"\\])*"|\b(?:true|false|null)\b|\b\d+(?:\.\d+)?\b/g
+  let cursor = 0
+  for (const match of source.matchAll(tokenPattern)) {
+    if (match.index > cursor) parts.push({ text: source.slice(cursor, match.index), tone: '' })
+    const token = match[0]
+    let tone = 'number'
+    if (token === 'TICK_DATA:') tone = 'tick-marker'
+    else if (/^(INFO|WARNING|ERROR|DEBUG)$/.test(token)) tone = `level-${token.toLowerCase()}`
+    else if (token.startsWith('"')) tone = /^\s*:/.test(source.slice(match.index + token.length)) ? 'json-key' : 'json-string'
+    else if (/^(true|false|null)$/.test(token)) tone = 'json-literal'
+    parts.push({ text: token, tone })
+    cursor = match.index + token.length
+  }
+  if (cursor < source.length) parts.push({ text: source.slice(cursor), tone: '' })
+  return parts
+}
+
+const visiblePreviewLines = computed(() => {
+  const keyword = previewKeyword.value.trim().toLowerCase()
+  const lines = (previewResult.value?.lines || []).map((line, index) => ({
+    text: line,
+    parts: previewCodeParts(line),
+    number: previewStartLine.value + index,
+  }))
+  return keyword ? lines.filter((item) => item.text.toLowerCase().includes(keyword)) : lines
+})
+
+async function loadPreview(line = 1, resetHistory = false) {
+  if (!previewFileId.value) return
+  previewRequestLine = line
+  previewBusy.value = true
+  previewError.value = ''
+  try {
+    const result = await api.filePreview(previewFileId.value, { line, limit: 100 })
+    previewIndexStatus.value = result.indexing ? 'indexing' : 'ready'
+    previewIndexProgress.value = result.index_progress || result.progress || 0
+    if (result.lines?.length) {
+      previewResult.value = result
+      previewStartLine.value = result.start_line || line
+      previewJumpLine.value = previewStartLine.value
+    } else if (!result.indexing) {
+      previewResult.value = result
+    }
+    if (resetHistory) previewPages.value = [line]
+    if (result.indexing) schedulePreviewIndexPoll()
+    else if (previewIndexTimer) clearTimeout(previewIndexTimer)
+  } catch (error) {
+    previewError.value = error.message
+  } finally {
+    previewBusy.value = false
+  }
+}
+
+function schedulePreviewIndexPoll() {
+  if (previewIndexTimer) clearTimeout(previewIndexTimer)
+  previewIndexTimer = setTimeout(async () => {
+    if (!previewFileId.value) return
+    try {
+      const status = await api.filePreviewIndex(previewFileId.value)
+      previewIndexStatus.value = status.status
+      previewIndexProgress.value = status.progress || 0
+      if (status.status === 'ready') loadPreview(previewRequestLine)
+      else if (status.status === 'indexing') schedulePreviewIndexPoll()
+      else previewError.value = '行号索引建立失败，请重新读取文件。'
+    } catch (error) {
+      previewError.value = error.message
+    }
+  }, 1200)
+}
+
+function nextPreviewPage() {
+  if (!previewResult.value?.has_more || !previewResult.value?.total_lines) return
+  const nextLine = previewStartLine.value + previewResult.value.lines.length
+  previewPages.value.push(nextLine)
+  loadPreview(nextLine)
+}
+
+function previousPreviewPage() {
+  if (previewPages.value.length < 2) return
+  previewPages.value.pop()
+  loadPreview(previewPages.value.at(-1))
+}
+
+function jumpToPreviewLine() {
+  const total = previewResult.value?.total_lines || 0
+  const target = Math.min(Math.max(Number(previewJumpLine.value) || 1, 1), total)
+  previewJumpLine.value = target
+  previewPages.value.push(target)
+  loadPreview(target)
+}
+
+watch(previewFileId, () => {
+  if (previewIndexTimer) clearTimeout(previewIndexTimer)
+  previewResult.value = null
+  previewPages.value = [1]
+  previewStartLine.value = 1
+  previewJumpLine.value = 1
+  previewIndexStatus.value = 'idle'
+  previewIndexProgress.value = 0
+  previewKeyword.value = ''
+  if (previewFileId.value) loadPreview(1, true)
+})
+watch(() => dataFiles.value[0]?.id, (fileId) => {
+  if (!previewFileId.value && fileId) previewFileId.value = fileId
+}, { immediate: true })
 
 const calendarWeekdays = ['一', '二', '三', '四', '五', '六', '日']
 const calendarMonths = Array.from({ length: 12 }, (_, index) => ({ value: index, label: `${index + 1}月` }))
@@ -46,7 +174,7 @@ async function scrollTerminalToBottom(force = false) {
   element.scrollTop = element.scrollHeight
 }
 
-watch(taskEvents, () => scrollTerminalToBottom(), { deep: true })
+watch(() => taskEvents.value.at(-1)?.id, () => scrollTerminalToBottom())
 watch(() => selectedTask.value?.id, () => {
   followTerminalLogs = true
   scrollTerminalToBottom(true)
@@ -54,15 +182,20 @@ watch(() => selectedTask.value?.id, () => {
 
 const navigation = [
   { id: 'dashboard', icon: '◈', label: '工作台', caption: '全局运行概览' },
-  { id: 'extract', icon: '◇', label: '压缩处理', caption: 'ZIP 解压与合并' },
+  { id: 'extract', icon: '◇', label: 'ZIP 合并', caption: '读取压缩包并合并日志' },
+  { id: 'preview', icon: '⌕', label: '文件预览', caption: '分批查看合并日志' },
   { id: 'validate', icon: '✓', label: '质量检查', caption: '定位异常数据' },
   { id: 'import', icon: '⇣', label: '数据导入', caption: '写入本地 MySQL' },
+  { id: 'coverage', icon: '▦', label: '数据覆盖', caption: '按年份与日期统计' },
   { id: 'records', icon: '≋', label: '数据查询', caption: '按表查看入库数据' },
   { id: 'database', icon: '▣', label: '数据库配置', caption: '本地连接参数' },
   { id: 'logs', icon: '⌁', label: '运行日志', caption: 'SSE 实时事件' },
 ]
 
 const page = computed(() => navigation.find((item) => item.id === section.value) || navigation[0])
+const activeExtractTask = computed(() => tasks.value.find((task) =>
+  task.type === 'extract' && ['pending', 'running', 'pausing', 'paused'].includes(task.status),
+))
 const fileBreakdown = computed(() => {
   const zipCount = files.value.filter((file) => file.extension === '.zip').length
   const logCount = files.value.filter((file) => ['.txt', '.log'].includes(file.extension)).length
@@ -87,6 +220,30 @@ function formatTickTime(value) {
   if (!value) return '—'
   return String(value).replace('T', ' ').replace(/(\.\d{3})\d+$/, '$1')
 }
+
+function formatDateTime(value) {
+  if (!value) return '—'
+  return String(value).replace('T', ' ').replace(/\.\d+$/, '')
+}
+
+function formatYearMonth(value) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(value || ''))
+  return match ? `${match[1]}年${Number(match[2])}月` : value || '—'
+}
+
+const coveragePieColors = ['#3978d4', '#16a394', '#ed9b36', '#8b72d9', '#df6474', '#54a66f', '#3ba8bf']
+const coveragePieStyle = computed(() => {
+  const years = databaseCoverage.value?.years || []
+  const total = years.reduce((sum, item) => sum + item.total, 0)
+  if (!total) return { background: '#e4e7ec' }
+  let position = 0
+  const slices = years.map((item, index) => {
+    const start = position
+    position += item.total / total * 100
+    return `${coveragePieColors[index % coveragePieColors.length]} ${start}% ${position}%`
+  })
+  return { background: `conic-gradient(${slices.join(', ')})` }
+})
 
 function datePart(key) {
   return databaseQuery.value[key]?.slice(0, 10) || ''
@@ -237,7 +394,10 @@ function handleCalendarOutside(event) {
 }
 
 onMounted(() => document.addEventListener('pointerdown', handleCalendarOutside))
-onBeforeUnmount(() => document.removeEventListener('pointerdown', handleCalendarOutside))
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', handleCalendarOutside)
+  if (previewIndexTimer) clearTimeout(previewIndexTimer)
+})
 
 const databasePaginationItems = computed(() => {
   const total = databaseRecords.value?.page_count || 0
@@ -274,12 +434,59 @@ function jumpToDatabasePage() {
   goToDatabasePage(pageJump.value)
 }
 
+function openTaskGroup(group, status) {
+  taskFilter.value = status
+  section.value = 'logs'
+  const task = group[0]
+  if (task) {
+    selectTask(task)
+  } else {
+    clearSelectedTask()
+  }
+}
+
+const visibleLogTasks = computed(() => {
+  if (taskFilter.value === 'running') {
+    return tasks.value.filter((task) => ['pending', 'running', 'pausing', 'paused'].includes(task.status))
+  }
+  if (taskFilter.value === 'success' || taskFilter.value === 'failed') {
+    return tasks.value.filter((task) => task.status === taskFilter.value)
+  }
+  return tasks.value
+})
+
+const taskFilterLabel = computed(() => ({
+  all: '全部任务',
+  running: '运行中任务',
+  success: '已完成任务',
+  failed: '异常任务',
+}[taskFilter.value]))
+
 function typeLabel(type) {
-  return { extract: '压缩处理', validate: '质量检查', import: '数据导入' }[type] || type
+  return { extract: 'ZIP 合并', validate: '质量检查', import: '数据导入' }[type] || type
+}
+
+function taskSourceLabel(task) {
+  if (!task) return ''
+  if (task.payload?.display_name) return task.payload.display_name
+  const fileId = task.payload?.file_id
+  if (fileId) return files.value.find((file) => file.id === fileId)?.name || `文件 ${fileId.slice(0, 8)}`
+  const fileIds = task.payload?.file_ids || []
+  if (fileIds.length) {
+    const names = fileIds.map((id) => files.value.find((file) => file.id === id)?.name).filter(Boolean)
+    if (names.length === 1) return names[0]
+    if (names.length) return `${names[0]} 等 ${fileIds.length} 个 ZIP`
+    return `${fileIds.length} 个 ZIP 文件`
+  }
+  return task.payload?.source_directory || '未记录来源'
 }
 
 function statusLabel(status) {
-  return { pending: '等待中', running: '运行中', success: '已完成', failed: '失败' }[status] || status
+  return { pending: '等待中', running: '运行中', pausing: '正在暂停', paused: '已暂停', success: '已完成', failed: '失败' }[status] || status
+}
+
+function eventTypeLabel(type) {
+  return { status: '状态', log: '说明', progress: '进度', result: '完成', error: '错误' }[type] || type
 }
 
 function eventTone(level) {
@@ -328,7 +535,7 @@ function eventTone(level) {
           <p>{{ page.caption }} · {{ new Date().toLocaleDateString('zh-CN') }}</p>
         </div>
         <div class="top-actions">
-          <div class="live-pill"><i></i>SSE 实时通道</div>
+          <div class="live-pill"><i></i>任务实时更新</div>
           <button class="ghost-button" @click="section = 'logs'">查看任务 {{ tasks.length }}</button>
         </div>
       </header>
@@ -338,14 +545,14 @@ function eventTone(level) {
           <div class="hero-copy">
             <span class="tag">本地数据自动化</span>
             <h2>数据处理流程，<br><em>一站式完成。</em></h2>
-            <p>从 ZIP 解压、日志合并、质量检查到 MySQL 入库，全程可视、可追踪、可回放。</p>
+            <p>从本地 ZIP 读取日志、筛选合并、质量检查到 MySQL 入库，全程可追踪、可回放。</p>
             <div class="hero-actions">
-              <button class="primary-button" @click="section = 'extract'">开始处理文件</button>
+              <button class="primary-button" @click="section = 'extract'">开始 ZIP 合并</button>
               <button class="secondary-button" @click="section = 'database'">配置本地数据库</button>
             </div>
           </div>
           <div class="pipeline-visual">
-            <div class="pipeline-node"><span>01</span><b>ZIP</b><small>安全解压</small></div>
+            <div class="pipeline-node"><span>01</span><b>ZIP</b><small>读取日志</small></div>
             <i>→</i>
             <div class="pipeline-node accent"><span>02</span><b>LOG</b><small>解析校验</small></div>
             <i>→</i>
@@ -354,16 +561,16 @@ function eventTone(level) {
         </div>
 
         <div class="metric-grid">
-          <article class="metric-card"><span class="metric-icon cyan">↻</span><div><small>运行中任务</small><strong>{{ runningTasks.length }}</strong><p>后台持续执行</p></div></article>
-          <article class="metric-card"><span class="metric-icon green">✓</span><div><small>已完成任务</small><strong>{{ successfulTasks.length }}</strong><p>结果已持久化</p></div></article>
-          <article class="metric-card"><span class="metric-icon orange">!</span><div><small>异常任务</small><strong>{{ failedTasks.length }}</strong><p>可查看完整日志</p></div></article>
+          <button type="button" class="metric-card metric-card-action" :aria-label="`筛选运行中任务，共 ${runningTasks.length} 个`" @click="openTaskGroup(runningTasks, 'running')"><span class="metric-icon cyan">↻</span><span class="metric-copy"><small>运行中任务</small><strong>{{ runningTasks.length }}</strong><span class="metric-detail">后台持续执行 · 点击筛选</span></span></button>
+          <button type="button" class="metric-card metric-card-action" :aria-label="`筛选已完成任务，共 ${successfulTasks.length} 个`" @click="openTaskGroup(successfulTasks, 'success')"><span class="metric-icon green">✓</span><span class="metric-copy"><small>已完成任务</small><strong>{{ successfulTasks.length }}</strong><span class="metric-detail">结果已持久化 · 点击筛选</span></span></button>
+          <button type="button" class="metric-card metric-card-action" :aria-label="`筛选异常任务，共 ${failedTasks.length} 个`" @click="openTaskGroup(failedTasks, 'failed')"><span class="metric-icon orange">!</span><span class="metric-copy"><small>异常任务</small><strong>{{ failedTasks.length }}</strong><span class="metric-detail">可查看完整日志 · 点击筛选</span></span></button>
           <article class="metric-card clickable" role="button" tabindex="0" @click="section = 'validate'" @keydown.enter="section = 'validate'"><span class="metric-icon violet">▤</span><div><small>项目托管文件</small><strong>{{ fileStats.available }}</strong><p>{{ fileStats.logs }} 个生成日志 · 点击查看</p></div></article>
         </div>
 
         <article class="panel dashboard-explain">
           <div class="dashboard-explain-icon">i</div>
-          <div><b>这里统计的是项目托管文件，不是数据库数据条数</b><p>当前托管文件 {{ fileStats.available }} 个，索引登记 {{ fileStats.indexed }} 条，缺失 {{ fileStats.missing }} 条，包含正常日志和 rejected 日志。解压临时目录不会计入；导入 MySQL 后的 Tick 行数，请进入“数据查询”查看。</p></div>
-          <div class="dashboard-explain-actions"><button class="text-button" @click="section = 'records'">查看数据库数据 →</button><div class="cleanup-action"><button class="danger-button" :disabled="busy.cleanup" @click="requestClearHistory">{{ busy.cleanup ? '正在清理…' : '清理项目文件与任务日志' }}</button><small>⚠️ 会删除历史任务和运行日志，不影响 MySQL 数据</small></div></div>
+          <div><b>项目文件统计与数据库记录分开计算</b><p>当前托管文件 {{ fileStats.available }} 个，索引登记 {{ fileStats.indexed }} 条，缺失 {{ fileStats.missing }} 条，包含合并日志和异常数据文件。任务临时文件不计入；MySQL 中的 Tick 记录数请查看“数据查询”。</p></div>
+          <div class="dashboard-explain-actions"><button class="text-button" @click="section = 'records'">查看数据库数据 →</button><div class="cleanup-action"><button class="danger-button" :disabled="busy.cleanup" @click="requestClearHistory">{{ busy.cleanup ? '正在清理…' : '清理生成文件与任务记录' }}</button><small>会删除项目生成文件、任务记录及运行日志，不影响 MySQL 数据</small></div></div>
         </article>
 
         <div class="two-column">
@@ -377,7 +584,7 @@ function eventTone(level) {
                 <span class="status-badge" :class="task.status">{{ statusLabel(task.status) }}</span>
               </button>
             </div>
-            <div v-else class="empty-state"><b>还没有任务</b><p>扫描本地 ZIP 开始第一项作业。</p></div>
+            <div v-else class="empty-state"><b>还没有任务</b><p>启动 ZIP 合并、质量检查或数据导入后，任务记录会显示在这里。</p></div>
           </article>
 
           <article class="panel system-panel">
@@ -385,7 +592,7 @@ function eventTone(level) {
             <div class="system-line"><span><i class="cyan-dot"></i>FastAPI 后台任务</span><b>{{ serverOnline ? '在线' : '离线' }}</b></div>
             <div class="system-line"><span><i class="green-dot"></i>SSE 事件推送</span><b>已启用</b></div>
             <div class="system-line"><span><i class="violet-dot"></i>本地 MySQL</span><b>{{ database.host }}:{{ database.port }}</b></div>
-            <div class="system-line"><span><i class="orange-dot"></i>时间戳去重</span><b>{{ adjustDuplicates ? '已启用' : '已关闭' }}</b></div>
+            <div class="system-line"><span><i class="orange-dot"></i>重复时间调整</span><b>{{ adjustDuplicates ? '已启用' : '已关闭' }}</b></div>
           </article>
         </div>
       </section>
@@ -393,53 +600,77 @@ function eventTone(level) {
       <section v-else-if="section === 'extract'" class="page-stack">
         <div class="two-column wide-left">
           <article class="panel">
-            <div class="panel-head"><div><span class="section-kicker">本地目录处理</span><h3>读取文件夹中的压缩包</h3></div><span class="tag subtle">不上传文件</span></div>
-            <div class="local-mode-note"><span class="local-mode-icon">⌂</span><div><b>文件始终留在本机</b><p>后端直接读取你填写的 Windows 文件夹，不会把 ZIP 上传到浏览器或复制到项目目录。</p></div></div>
-            <div class="directory-setup-card">
-              <div class="directory-setup-head"><div><span class="field-label">本地根目录配置</span><strong>配置一次，后续快速选择</strong></div><span class="directory-status">本机读取</span></div>
-              <div class="directory-config"><input v-model="localRootDirectory" placeholder="例如 D:\JoinQuant\jq_log_data" @keyup.enter="reopenLocalDirectory()" /><button class="secondary-button" type="button" :disabled="busy.directory" @click="reopenLocalDirectory()">{{ busy.directory ? "读取中…" : (localBrowserLastPath ? "继续选择" : "打开目录") }}</button></div>
-              <div class="directory-tip directory-tip-primary"><span class="directory-tip-icon">1</span><div><b>先填写数据根目录</b><p>例如 <code>D:\JoinQuant\jq_log_data</code>，点击“打开目录”后再选择品种、年份和月份。</p></div></div>
+            <div class="panel-head"><div><span class="section-kicker">本地 ZIP 处理</span><h3>选择并合并压缩包中的日志</h3></div><span class="tag subtle">本机直读</span></div>
+            <div class="field directory-manual-field">
+              <span><b>选择数据文件夹</b><em>使用 Windows 文件夹窗口，或直接填写路径</em></span>
+              <div class="directory-config"><input v-model="localDirectory" placeholder="选择或输入 ZIP 所在文件夹" @keyup.enter="scanLocalArchives" /><button class="secondary-button" type="button" :disabled="busy.directory || busy.scan" @click="pickLocalDirectory">{{ busy.directory ? '正在打开…' : '浏览文件夹' }}</button></div>
             </div>
-            <div v-if="localBrowserOpen" class="directory-browser">
-              <div class="directory-browser-head"><div><span class="field-label">目录选择</span><strong>按层级进入目标文件夹</strong></div><span class="directory-step">步骤 2 / 3</span></div>
-              <div class="directory-current"><span>当前目录</span><code>{{ localBrowserPath }}</code></div>
-              <div class="directory-picker">
-                <button class="directory-picker-trigger" type="button" :disabled="busy.directory || !localBrowserDirectories.length" @click="toggleLocalDirectoryMenu"><span class="directory-folder-icon">▣</span><span>{{ localBrowserDirectories.length ? "选择下级文件夹" : "当前目录没有下级文件夹" }}</span><i :class="{ rotated: localDirectoryMenuOpen }">⌄</i></button>
-                <div v-if="localDirectoryMenuOpen" class="directory-picker-menu"><button v-for="directory in localBrowserDirectories" :key="directory.path" class="directory-option" type="button" @click="browseLocalDirectory(directory.path)"><span class="directory-option-icon">▣</span><span class="directory-option-copy"><b>{{ directory.name }}</b><small>进入此文件夹</small></span><strong>›</strong></button></div>
+            <div class="scope-section"><div class="scope-section-head"><div><span class="field-label">处理范围</span><strong>{{ mergeScope === 'year' ? '全年合并' : '按月筛选' }}</strong></div><span class="scope-section-path">{{ localDirectory || '尚未选择处理目录' }}</span></div><div class="scope-grid"><button class="scope-card" :class="{ active: mergeScope === 'month' }" :aria-pressed="mergeScope === 'month'" @click="mergeScope = 'month'"><span class="scope-choice-mark">{{ mergeScope === 'month' ? '✓' : '' }}</span><b>按月筛选</b><small>处理当前月份目录；选择年度目录时，可勾选一个或多个指定月份</small></button><button class="scope-card" :class="{ active: mergeScope === 'year' }" :aria-pressed="mergeScope === 'year'" @click="mergeScope = 'year'"><span class="scope-choice-mark">{{ mergeScope === 'year' ? '✓' : '' }}</span><b>全年合并</b><small>按月份顺序处理所选年度目录中的全部 ZIP</small></button></div></div>
+            <div v-if="monthDirectories.length" class="field month-picker-field"><div class="month-picker-heading"><span>月份范围</span><div><button type="button" :disabled="selectedMonthDirectories.length === monthDirectories.length" @click="selectAllMonthDirectories">全选</button><button type="button" :disabled="!selectedMonthDirectories.length" @click="clearSelectedMonthDirectories">清空</button></div></div><div class="month-picker"><button v-for="directory in monthDirectories" :key="directory" type="button" class="month-option" :class="{ selected: selectedMonthDirectories.includes(directory) }" :aria-pressed="selectedMonthDirectories.includes(directory)" @click="toggleMonthDirectory(directory)"><span class="month-check">{{ selectedMonthDirectories.includes(directory) ? '✓' : '' }}</span>{{ directoryName(directory) }}</button></div><div class="month-selection-summary">已选 {{ selectedMonthDirectories.length }} / {{ monthDirectories.length }} 个月{{ selectedMonthDirectories.length ? ' · 重新扫描后更新 ZIP 清单' : ' · 至少选择一个月份' }}</div></div>
+            <div class="scan-action"><button class="secondary-button full" :disabled="busy.scan || busy.directory || !localDirectory.trim() || (monthDirectories.length > 0 && mergeScope === 'month' && !selectedMonthDirectories.length)" @click="scanLocalArchives">{{ busy.scan ? '正在扫描目录…' : localArchives.length ? '重新扫描 ZIP' : '扫描 ZIP' }}</button></div>
+            <div v-if="localArchives.length" class="archive-selection">
+              <div class="archive-selection-head"><div><b>选择处理文件</b><small>已选 {{ selectedLocalArchiveIds.length }} / {{ localArchives.length }} 个 ZIP</small></div><div><button type="button" :disabled="selectedLocalArchiveIds.length === localArchives.length" @click="selectAllLocalArchives">全选</button><button type="button" :disabled="!selectedLocalArchiveIds.length" @click="clearSelectedLocalArchives">清空</button></div></div>
+              <div class="archive-list" role="group" aria-label="扫描到的 ZIP 文件">
+                <label v-for="archive in localArchives" :key="archive.id" class="archive-option" :class="{ selected: selectedLocalArchiveIds.includes(archive.id) }">
+                  <input type="checkbox" :checked="selectedLocalArchiveIds.includes(archive.id)" @change="toggleLocalArchive(archive.id)" />
+                  <span class="archive-file-icon" aria-hidden="true">ZIP</span>
+                  <span class="archive-option-name" :title="archive.name">{{ archive.name }}</span>
+                  <span v-if="archive.month_directory" class="archive-month-label">{{ archive.month_directory }}</span>
+                  <span v-else class="archive-month-label unknown">月份未识别</span>
+                  <span class="archive-option-check">{{ selectedLocalArchiveIds.includes(archive.id) ? '已选' : '' }}</span>
+                </label>
               </div>
-              <div class="directory-browser-actions"><button class="ghost-button" type="button" :disabled="localBrowserPath === localBrowserRootPath" @click="browseLocalDirectoryUp">上一级</button><button class="ghost-button" type="button" @click="useLocalBrowserDirectory">使用当前目录</button><button class="ghost-button" type="button" @click="closeLocalDirectoryBrowser">关闭</button></div>
-              <div class="directory-tip directory-tip-secondary"><span class="directory-tip-icon">3</span><div><b>选好后使用当前目录</b><p>系统会自动填入下方路径，然后点击“扫描目录中的 ZIP”。</p></div></div>
+              <small class="archive-selection-path">{{ scanMessage || `扫描目录：${localDirectory}` }}</small>
             </div>
-            <label class="field directory-manual-field"><span>本地目录路径 <em>也可手动填写</em></span><input v-model="localDirectory" placeholder="例如 D:\JoinQuant\jq_log_data\A\2023\10月" /><small>支持月份目录或年份目录；手动填写与下拉选择效果相同。</small></label>
-            <div class="scope-grid"><button class="scope-card" :class="{ active: mergeScope === 'month' }" @click="mergeScope = 'month'"><b>单月合并</b><small>只处理一个月份的 ZIP 文件</small><span>适合：选择到 `A\2023\10月` 这样的月份目录</span></button><button class="scope-card" :class="{ active: mergeScope === 'year' }" @click="mergeScope = 'year'"><b>按年合并</b><small>自动处理该年份下的全部月份</small><span>适合：选择到 `A\\2023` 这样的年份目录</span></button></div>
-            <button class="secondary-button full" :disabled="busy.scan" @click="scanLocalArchives">{{ busy.scan ? '正在扫描本地目录…' : '扫描目录中的 ZIP' }}</button>
-            <div v-if="monthDirectories.length" class="field month-picker-field"><span>选择需要补充的月份</span><div class="month-picker"><button v-for="directory in monthDirectories" :key="directory" type="button" class="month-option" :class="{ selected: selectedMonthDirectories.includes(directory) }" @click="toggleMonthDirectory(directory)"><span class="month-check">{{ selectedMonthDirectories.includes(directory) ? '✓' : '' }}</span>{{ directoryName(directory) }}</button></div><small>可多选月份，选中后显示 `✓`；然后点击“扫描目录中的 ZIP”，只合并选中的月份。</small><div class="month-selection-summary">已选择 {{ selectedMonthDirectories.length }} 个月</div></div>
-            <div v-if="localArchives.length" class="scan-result"><div><b>已发现 {{ localArchives.length }} 个 ZIP 文件</b><small>{{ scanMessage || (mergeScope === 'year' ? '已扫描年度目录' : '已扫描当前月份目录') }}</small></div><span class="scan-check">✓</span></div>
-            <div v-else-if="scanMessage" class="empty-inline local-empty">{{ scanMessage }}</div>
-            <div v-else class="empty-inline local-empty">填写目录并点击扫描，系统会显示可处理的 ZIP 数量。</div>
+            <div v-else-if="scanMessage" class="empty-inline local-empty" :class="{ 'scan-error': /失败|不存在|请检查|错误/.test(scanMessage) }">{{ scanMessage }}</div>
+            <div v-else class="empty-inline local-empty">{{ localDirectory ? '尚未扫描此目录。扫描后会显示 ZIP 数量和处理范围。' : '先选择或填写处理目录。' }}</div>
           </article>
 
           <article class="panel action-panel">
-            <span class="section-kicker">压缩处理流程</span>
-            <h3>解压并合并日志</h3>
-            <p>直接流式读取本地 ZIP，定位内部 <code>log.txt</code>，截取有效区间并生成合并日志，不会一次性加载大文件。</p>
+            <span class="section-kicker">ZIP 读取与合并</span>
+            <h3>读取 ZIP 并合并日志</h3>
+            <p>读取 ZIP 内的 <code>log.txt</code>，筛选有效 Tick 数据和目标品种，生成合并日志及异常数据文件。</p>
             <label class="field"><span>输出文件名</span><div class="filename-editor"><span class="filename-prefix">{{ outputNamePrefix }}</span><input v-model="outputNameSuffix" placeholder="例如 2023_04.txt" /></div><small>商品标识由目标品种自动生成且不可修改；只能编辑后面的年份、月份或自定义说明。</small></label>
             <label class="field"><span>目标品种 <i class="field-hint">来自本地数据库</i></span><select v-model="targetProduct" :disabled="targetProductLocked"><option value="">请选择目标品种</option><option v-for="product in databaseTables" :key="product.code" :value="product.code">{{ product.label }}</option></select><small v-if="databaseTablesError" class="error-text">{{ databaseTablesError }}</small><small v-else-if="targetProductLocked" class="matched-text">✓ 已根据本地目录自动匹配 {{ targetProduct }}</small><small v-else-if="!databaseTables.length">请先配置数据库并确保存在 `tick_data_品种代码` 表。</small></label>
-            <div class="filter-tip"><span>✓</span><p>合并时会读取每行的 <code>underlying_symbol</code>、<code>code</code> 和 <code>commodity_name</code>。不属于目标品种的数据会被移到 rejected 文件，不进入干净日志。</p></div>
-            <div class="flow-steps"><span>解压文件</span><i>→</i><span>识别日志</span><i>→</i><span>截取数据</span><i>→</i><span>合并输出</span></div>
-            <button class="primary-button full" :disabled="busy.extract || !localArchives.length" @click="startExtract">
-              {{ busy.extract ? '正在创建任务…' : `开始${mergeScope === 'year' ? '年度' : '单月'}合并 ${localArchives.length} 个压缩包` }}
+            <div class="filter-tip"><span>✓</span><p>按 <code>underlying_symbol</code>、<code>code</code> 和 <code>commodity_name</code> 筛选目标品种；格式错误、字段异常或品种不匹配的数据会写入异常数据文件（rejected）。</p></div>
+            <div class="flow-steps"><span>读取 ZIP</span><i>→</i><span>定位 log.txt</span><i>→</i><span>筛选有效 Tick</span><i>→</i><span>写入合并日志</span></div>
+            <div v-if="activeExtractTask" class="extract-task-state" :class="activeExtractTask.status">
+              <div><b>{{ activeExtractTask.status === 'paused' ? '合并任务已暂停' : 'ZIP 正在合并' }}</b><small>{{ activeExtractTask.message }} · {{ activeExtractTask.progress || 0 }}%</small></div>
+              <button type="button" class="text-button" @click="section = 'logs'">查看任务</button>
+            </div>
+            <button class="primary-button full" :disabled="busy.extract || busy.upload || !localArchives.length || Boolean(activeExtractTask)" @click="startExtract">
+              {{ busy.extract ? '正在创建任务…' : activeExtractTask ? (activeExtractTask.status === 'paused' ? '已有暂停任务，请先处理该任务' : '已有合并任务正在运行') : `开始${mergeScope === 'year' ? '全年' : '按月'}合并 ${selectedLocalArchiveIds.length} / ${localArchives.length} 个 ZIP` }}
             </button>
           </article>
         </div>
       </section>
 
+      <section v-else-if="section === 'preview'" class="page-stack">
+        <article class="panel control-strip preview-controls">
+          <div><span class="section-kicker">合并结果</span><h3>日志文件预览</h3><p>选中文件后自动读取首批数据，按需继续浏览。</p></div>
+          <div class="control-actions preview-actions">
+            <label class="field select-field"><span>日志文件</span><select v-model="previewFileId"><option value="">请选择合并日志</option><option v-for="file in dataFiles" :key="file.id" :value="file.id">{{ file.name }}</option></select></label>
+            <button class="secondary-button preview-refresh-button" :disabled="previewBusy || !previewFileId" @click="loadPreview(1, true)">{{ previewBusy ? '读取中…' : '重新读取' }}</button>
+          </div>
+        </article>
+        <article class="panel preview-panel">
+          <div class="panel-head"><div><span class="section-kicker">原始 Tick 日志</span><h3>{{ dataFiles.find((file) => file.id === previewFileId)?.name || '尚未选择文件' }}</h3><small v-if="previewResult" class="result-caption">文件大小 {{ formatBytes(previewResult.size) }} · <template v-if="previewResult.total_lines">共 {{ previewResult.total_lines.toLocaleString() }} 行 · 当前 {{ previewStartLine.toLocaleString() }}–{{ (previewStartLine + previewResult.lines.length - 1).toLocaleString() }} 行</template><template v-else>正在统计总行数 {{ previewIndexProgress }}% · 当前显示 {{ previewResult.lines.length }} 行</template></small></div><label v-if="previewResult" class="field preview-search"><span>本批搜索</span><input v-model="previewKeyword" placeholder="输入关键词" /></label></div>
+          <div v-if="previewError" class="empty-inline scan-error">{{ previewError }}</div>
+          <div v-else-if="previewBusy && !previewResult" class="empty-state"><b>正在读取文件…</b></div>
+          <div v-else-if="!previewResult" class="empty-state"><b>选择一个合并日志开始查看</b><p>每批最多读取 100 行。</p></div>
+          <template v-else>
+            <div class="preview-lines"><div v-for="item in visiblePreviewLines" :key="`${previewStartLine}-${item.number}`"><span>{{ item.number.toLocaleString() }}</span><code><span v-for="(part, partIndex) in item.parts" :key="partIndex" :class="part.tone">{{ part.text }}</span></code></div><div v-if="!visiblePreviewLines.length" class="empty-inline">本批没有匹配的行</div></div>
+            <div class="preview-pagination"><form class="preview-line-jump" @submit.prevent="jumpToPreviewLine"><label for="preview-line-number">跳转行</label><input id="preview-line-number" v-model.number="previewJumpLine" type="number" min="1" :max="previewResult.total_lines || undefined" :disabled="previewBusy || !previewResult.total_lines" /><span v-if="previewResult.total_lines">/ {{ previewResult.total_lines.toLocaleString() }}</span><button class="secondary-button" type="submit" :disabled="previewBusy || !previewResult.total_lines">跳转</button></form><div class="preview-page-actions"><button class="secondary-button" :disabled="previewBusy || previewPages.length < 2" @click="previousPreviewPage">上一批</button><button class="primary-button" :disabled="previewBusy || !previewResult.total_lines || !previewResult.has_more" @click="nextPreviewPage">{{ previewBusy ? '读取中…' : '下一批' }}</button></div></div>
+          </template>
+        </article>
+      </section>
+
       <section v-else-if="section === 'validate'" class="page-stack">
-        <article class="panel control-strip">
+        <article class="panel control-strip quality-toolbar">
           <div><span class="section-kicker">入库前检查</span><h3>数据质量检查</h3><p>入库前检查解析错误、缺失字段、盘口异常和重复时间戳。</p></div>
-          <div class="control-actions">
+          <div class="control-actions quality-toolbar-actions">
             <label class="field select-field"><span>日志文件</span><select v-model="selectedDataFileId"><option value="">请选择</option><option v-for="file in dataFiles" :key="file.id" :value="file.id">{{ file.name }}</option></select></label>
-            <label class="switch-line"><input v-model="adjustDuplicates" type="checkbox" /><span></span>模拟时间戳去重</label>
+            <label class="switch-line"><input v-model="adjustDuplicates" type="checkbox" /><span></span>模拟重复时间戳调整</label>
             <button class="primary-button" :disabled="busy.validate || !selectedDataFileId" @click="startValidate">{{ busy.validate ? '启动中…' : '运行检查' }}</button>
           </div>
         </article>
@@ -490,11 +721,69 @@ function eventTone(level) {
             <template v-if="latestImport">
               <div class="result-number"><strong>{{ latestImport.inserted }}</strong><span>新增记录</span></div>
               <div class="result-grid"><div><small>重复跳过</small><b>{{ latestImport.duplicates }}</b></div><div><small>解析失败</small><b>{{ latestImport.failed_parse }}</b></div><div><small>写入失败</small><b>{{ latestImport.failed_insert }}</b></div><div><small>时间调整</small><b>{{ latestImport.timestamp_adjustments }}</b></div></div>
-              <div class="result-meta"><span>数据库</span><b>{{ latestImport.database }} / {{ latestImport.table }}</b><span>数据范围</span><b>{{ latestImport.database_stats?.min_time || '—' }} → {{ latestImport.database_stats?.max_time || '—' }}</b></div>
+              <div class="result-meta"><span>数据库</span><b>{{ latestImport.database }} / {{ latestImport.table }}</b><span>本次入库</span><b>新增 {{ latestImport.inserted }} 条，重复跳过 {{ latestImport.duplicates }} 条</b><span>日期范围</span><b>{{ formatDateTime(latestImport.database_stats?.min_time) }} → {{ formatDateTime(latestImport.database_stats?.max_time) }}</b></div>
             </template>
             <div v-else class="empty-state tall"><b>暂无导入记录</b><p>导入完成后显示新增、重复和失败统计。</p></div>
           </article>
         </div>
+      </section>
+
+      <section v-else-if="section === 'coverage'" class="page-stack">
+        <article class="panel coverage-toolbar">
+          <div><span class="section-kicker">数据库日期档案</span><h3>数据覆盖统计</h3></div>
+          <div class="coverage-controls">
+            <label class="field"><span>数据表</span><select v-model="coverageTable" @change="queryDatabaseCoverage({ table: coverageTable, year: null, month: null, refresh: true })"><option v-for="table in tableOptions" :key="table.value" :value="table.value">{{ table.label }}</option></select></label>
+            <button class="secondary-button" :disabled="busy.coverage || !coverageTable" @click="queryDatabaseCoverage({ year: null, month: null, refresh: true })">{{ busy.coverage ? '统计中…' : '刷新统计' }}</button>
+          </div>
+        </article>
+
+        <div v-if="coverageError" class="empty-inline coverage-error">{{ coverageError }}</div>
+        <article v-else-if="busy.coverage && !databaseCoverage" class="panel empty-state records-placeholder"><b>正在读取日期覆盖…</b></article>
+        <template v-else-if="databaseCoverage">
+          <div class="coverage-periods">
+            <article v-for="period in [
+              { key: 'day', label: '今天', range: '自然日' },
+              { key: 'week', label: '本周', range: '周一至今天' },
+              { key: 'month', label: '本月', range: '自然月' },
+              { key: 'year', label: '今年', range: '自然年' },
+            ]" :key="period.key" class="coverage-period">
+              <small>{{ period.label }}</small><strong>{{ databaseCoverage.periods[period.key].toLocaleString() }}</strong><span>{{ period.range }} · 条</span>
+            </article>
+            <article class="coverage-period coverage-total"><small>表内累计</small><strong>{{ databaseCoverage.total.toLocaleString() }}</strong><span>Tick 条数 · {{ databaseCoverage.min_year }} 至 {{ databaseCoverage.max_year }}</span></article>
+          </div>
+
+          <article class="panel coverage-years-panel">
+            <div class="panel-head"><div><span class="section-kicker">完整年份</span><h3>实际存在数据的年份</h3><small class="result-caption">仅列出数据库中确实有 Tick 记录的年份</small></div><span class="tag subtle">{{ databaseCoverage.years.length }} 年</span></div>
+            <div class="coverage-years-layout">
+              <div class="coverage-year-list">
+                <button v-for="(item, index) in databaseCoverage.years" :key="item.year" type="button" class="coverage-year" :class="{ active: item.year === coverageYear }" @click="queryDatabaseCoverage({ year: item.year, month: null })"><i :style="{ background: coveragePieColors[index % coveragePieColors.length] }"></i><b>{{ item.year }}</b><span>{{ item.total.toLocaleString() }} 条</span><small>{{ (item.total / databaseCoverage.total * 100).toFixed(1) }}%</small></button>
+              </div>
+              <div class="coverage-pie" :style="coveragePieStyle" role="img" aria-label="各年份数据量占比"><div><strong>{{ databaseCoverage.years.length }}</strong><span>个年份</span></div></div>
+            </div>
+          </article>
+
+          <div class="coverage-detail-grid">
+            <article class="panel coverage-chart-panel">
+              <div class="panel-head"><div><span class="section-kicker">{{ coverageYear }} 年</span><h3>每月数据量</h3></div><strong>{{ databaseCoverage.selected_year_total.toLocaleString() }} 条</strong></div>
+              <div v-if="databaseCoverage.months.length" class="coverage-month-chart">
+                <button v-for="item in databaseCoverage.months" :key="item.month" type="button" class="coverage-month" :class="{ active: item.month === coverageMonth }" :title="`${item.month} 月 · ${item.total.toLocaleString()} 条`" @click="queryDatabaseCoverage({ year: coverageYear, month: item.month })">
+                  <span class="coverage-bar-value">{{ item.total.toLocaleString() }}</span><span class="coverage-bar-track"><i :style="{ height: `${Math.max(4, item.total / Math.max(...databaseCoverage.months.map((entry) => entry.total)) * 100)}%` }"></i></span><b>{{ item.month }}月</b>
+                </button>
+              </div>
+              <div v-else class="empty-inline">该年份没有月份统计</div>
+            </article>
+
+            <article class="panel coverage-days-panel">
+              <div class="panel-head"><div><span class="section-kicker">日期明细</span><h3>{{ coverageMonth ? `${coverageYear}年${coverageMonth}月` : `${coverageYear}年` }} · 有数据日期</h3></div><strong>{{ databaseCoverage.selected_month_total.toLocaleString() }} 条</strong></div>
+              <div v-if="coverageMonth && databaseCoverage.days.length" class="coverage-day-list">
+                <div v-for="item in databaseCoverage.days" :key="item.day" class="coverage-day"><time>{{ coverageYear }}-{{ String(coverageMonth).padStart(2, '0') }}-{{ String(item.day).padStart(2, '0') }}</time><b>{{ item.total.toLocaleString() }}</b><span>条</span></div>
+              </div>
+              <div v-else-if="coverageMonth" class="empty-inline">该月没有日期记录</div>
+              <div v-else class="empty-inline">选择左侧月份，查看每天的数据条数</div>
+            </article>
+          </div>
+        </template>
+        <article v-else class="panel empty-state records-placeholder"><b>没有可统计的数据表</b><p>配置数据库并创建或导入 Tick 表后，这里会列出实际入库年份与日期。</p></article>
       </section>
 
       <section v-else-if="section === 'records'" class="page-stack">
@@ -549,7 +838,7 @@ function eventTone(level) {
           <div class="panel-head"><div><span class="section-kicker">查询结果</span><h3>共 {{ databaseRecords.total }} 条匹配记录</h3><small class="result-caption">{{ databaseRecords.groups?.length || 0 }} 个数据表分组 · 每组显示 {{ databaseRecords.page_size }} 条</small></div><span class="tag subtle">{{ databaseRecords.database }}</span></div>
           <div v-if="databaseRecords.groups?.length" class="record-groups">
             <section v-for="group in databaseRecords.groups" :key="group.name" class="record-group">
-              <div class="record-group-head"><div><b>{{ group.label }}</b><small>{{ group.name }} · {{ group.min_time || '暂无时间范围' }} → {{ group.max_time || '暂无时间范围' }}</small></div><strong>{{ group.total }} 条</strong></div>
+              <div class="record-group-head"><div><b>{{ group.label }}</b><small class="record-group-range"><span>{{ group.name }}</span><span class="record-time-range"><time>{{ formatDateTime(group.min_time) }}</time><i>→</i><time>{{ formatDateTime(group.max_time) }}</time></span></small></div><strong>{{ group.total }} 条</strong></div>
               <div v-if="group.rows.length" class="record-table-wrap">
                 <table class="record-table">
                   <thead><tr><th>ID</th><th>合约</th><th>Tick 时间</th><th>最新价</th><th>开盘</th><th>最高</th><th>最低</th><th>成交量</th><th>成交额</th><th>持仓</th><th>卖一</th><th>买一</th><th>品种</th><th>交易所</th></tr></thead>
@@ -598,22 +887,27 @@ function eventTone(level) {
 
       <section v-else class="logs-layout">
         <aside class="task-sidebar panel">
-          <div class="panel-head"><div><span class="section-kicker">历史任务</span><h3>任务记录</h3></div><span class="tag subtle">{{ tasks.length }}</span></div>
+          <div class="panel-head"><div><span class="section-kicker">{{ taskFilterLabel }}</span><h3>任务记录</h3></div><div class="task-filter-actions"><span class="tag subtle">{{ visibleLogTasks.length }}</span><button v-if="taskFilter !== 'all'" class="text-button" type="button" @click="taskFilter = 'all'">显示全部</button></div></div>
           <div class="task-list">
-            <button v-for="task in tasks" :key="task.id" class="task-row log-task" :class="{ selected: selectedTask?.id === task.id }" @click="selectTask(task)">
-              <span class="task-type">{{ typeLabel(task.type).slice(0, 1) }}</span><span class="task-main"><b>{{ typeLabel(task.type) }}</b><small>{{ task.created_at }}</small></span><span class="status-dot" :class="task.status"></span>
+            <button v-for="task in visibleLogTasks" :key="task.id" class="task-row log-task" :class="{ selected: selectedTask?.id === task.id }" @click="selectTask(task)">
+              <span class="task-type">{{ typeLabel(task.type).slice(0, 1) }}</span><span class="task-main"><b>{{ typeLabel(task.type) }}</b><small :title="taskSourceLabel(task)">{{ taskSourceLabel(task) }} · {{ task.created_at }}</small></span><span class="status-dot" :class="task.status"></span>
             </button>
-            <div v-if="!tasks.length" class="empty-inline">尚无任务记录</div>
+            <div v-if="!visibleLogTasks.length" class="empty-inline">{{ taskFilter === 'all' ? '尚无任务记录' : `没有${taskFilterLabel}记录` }}</div>
           </div>
         </aside>
         <article class="terminal-panel">
-          <div class="terminal-head"><div class="terminal-dots"><i></i><i></i><i></i></div><div><b>{{ selectedTask ? `${typeLabel(selectedTask.type)} · ${selectedTask.id.slice(0, 8)}` : '实时运行日志' }}</b><small>{{ selectedTask?.message || '选择左侧任务查看事件流' }}</small></div><span v-if="selectedTask" class="status-badge" :class="selectedTask.status">{{ statusLabel(selectedTask.status) }}</span></div>
+          <div class="terminal-head"><div class="terminal-dots"><i></i><i></i><i></i></div><div class="terminal-title"><b :title="selectedTask ? `${typeLabel(selectedTask.type)} · ${taskSourceLabel(selectedTask)}` : '实时运行日志'">{{ selectedTask ? `${typeLabel(selectedTask.type)} · ${taskSourceLabel(selectedTask)}` : '实时运行日志' }}</b><small :title="selectedTask?.message">{{ selectedTask?.message || '选择左侧任务查看事件流' }}</small></div><span v-if="selectedTask" class="status-badge" :class="selectedTask.status">{{ statusLabel(selectedTask.status) }}</span><button v-if="selectedTask?.type === 'extract' && ['pending', 'running'].includes(selectedTask.status)" class="task-control-button pause" type="button" title="处理完当前压缩包后暂停任务" aria-label="暂停任务" @click="setTaskPaused(selectedTask, true)"><i aria-hidden="true">Ⅱ</i><span>暂停任务</span></button><button v-else-if="selectedTask?.type === 'extract' && selectedTask.status === 'paused'" class="task-control-button resume" type="button" title="从下一个未完成的压缩包继续" aria-label="继续任务" @click="setTaskPaused(selectedTask, false)"><i aria-hidden="true">▶</i><span>继续任务</span></button></div>
           <div v-if="selectedTask" class="terminal-progress"><i :style="{ width: `${selectedTask.progress}%` }"></i><span>{{ selectedTask.progress }}%</span></div>
+          <div class="terminal-history-controls">
+            <button class="history-button older" type="button" :disabled="!hasOlderEvents || eventHistoryBusy" :title="hasOlderEvents ? '查看更早的任务事件' : '没有更早的任务事件'" @click="loadOlderEvents"><span aria-hidden="true">↑</span>{{ eventHistoryBusy ? '读取中…' : hasOlderEvents ? '加载更早日志' : '没有更早日志' }}</button>
+            <span class="history-position">显示 {{ taskEvents.length }} 条 / 共 {{ selectedTask?.last_event_id || 0 }} 条</span>
+            <button class="history-button latest" type="button" :disabled="eventHistoryBusy" title="重新读取任务最新日志" @click="loadNewerEvents"><span aria-hidden="true">↻</span>{{ eventHistoryBusy ? '读取中…' : '刷新最新日志' }}</button>
+          </div>
           <div ref="terminalBody" class="terminal-body" @scroll="handleTerminalScroll">
-            <div v-for="event in taskEvents" :key="event.id" class="terminal-line" :class="eventTone(event.level)"><time>{{ event.timestamp?.slice(11) }}</time><span>{{ event.type.toUpperCase().padEnd(8) }}</span><p>{{ event.message }}</p></div>
+            <div v-for="event in taskEvents" :key="event.id" class="terminal-line" :class="eventTone(event.level)"><time>{{ event.timestamp?.slice(11) }}</time><span>{{ eventTypeLabel(event.type) }}</span><p>{{ event.message }}</p></div>
             <div v-if="!taskEvents.length" class="terminal-placeholder"><span>⌁</span><p>等待任务事件...</p></div>
           </div>
-          <div class="terminal-foot"><span><i></i>{{ selectedTask && ['pending', 'running'].includes(selectedTask.status) ? 'SSE 已连接，实时接收中' : '事件已持久化，可随时回放' }}</span><b>{{ taskEvents.length }} EVENTS</b></div>
+          <div class="terminal-foot"><span><i :class="sseStatus"></i>{{ sseStatus === 'connected' ? '实时接收中' : sseStatus === 'connecting' ? '正在连接实时日志' : sseStatus === 'reconnecting' ? '连接中断，正在自动重连' : '实时日志未连接' }}</span><b>显示 {{ taskEvents.length }} / 共 {{ selectedTask?.last_event_id || 0 }} 条</b></div>
         </article>
       </section>
     </main>
@@ -623,7 +917,7 @@ function eventTone(level) {
         <section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="cleanup-title">
           <div class="confirm-modal-head"><span class="confirm-warning-icon">⚠</span><div><span class="section-kicker">危险操作确认</span><h2 id="cleanup-title">清理项目文件与任务日志</h2></div></div>
           <p class="confirm-lead">此操作不可撤销，请确认后继续。</p>
-          <div class="confirm-warning-box"><b>⚠️ 将会删除</b><p>项目托管文件、生成的 TXT/rejected 文件、解压临时目录、文件索引、历史任务，以及运行日志和事件记录。</p></div>
+          <div class="confirm-warning-box"><b>将会删除</b><p>项目生成的合并日志与异常数据文件、任务临时文件、文件索引、历史任务，以及运行日志和事件记录。</p></div>
           <div class="confirm-safe-box"><b>不会删除</b><p><code>D:\JoinQuant\jq_log_data</code> 原始 ZIP 和 MySQL 中已经导入的数据。</p></div>
           <div class="confirm-modal-actions"><button class="secondary-button" :disabled="busy.cleanup" @click="cancelClearHistory">取消</button><button class="danger-button" :disabled="busy.cleanup" @click="clearHistory">{{ busy.cleanup ? '正在清理…' : '确定清理' }}</button></div>
         </section>

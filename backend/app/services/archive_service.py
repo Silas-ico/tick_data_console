@@ -83,6 +83,47 @@ def _directory_product(directory: Path) -> str:
     return candidate.upper() if re.fullmatch(r"[A-Za-z]{1,3}", candidate) else ""
 
 
+def _archive_period_label(path: Path) -> str:
+    """Return the year/month represented by a local archive's parent folder."""
+    parts = path.parts
+    for index in range(len(parts) - 2, -1, -1):
+        month_name = parts[index].strip()
+        if not MONTH_DIRECTORY_RE.fullmatch(month_name):
+            continue
+        year_name = parts[index - 1].strip() if index else ""
+        if YEAR_DIRECTORY_RE.fullmatch(year_name):
+            return f"{year_name}年{int(month_name[:-1])}月"
+        return f"{int(month_name[:-1])}月"
+    return ""
+
+
+def archive_month_directory(archive_path: Path, scan_directory: Path) -> str | None:
+    """Find the nearest month folder below the scanned directory for UI labels."""
+    scan_directory = scan_directory.resolve()
+    resolved_archive = archive_path.resolve()
+    for candidate in (resolved_archive.parent, *resolved_archive.parents):
+        if MONTH_DIRECTORY_RE.fullmatch(candidate.name.strip()) and (
+            candidate == scan_directory or scan_directory in candidate.parents
+        ):
+            return candidate.name.strip()
+        if candidate == scan_directory:
+            break
+    return None
+
+
+def _archive_sort_key(path: Path) -> tuple:
+    """Sort local archives by the nearest month/year folders before filename."""
+    parts = path.parts
+    for index in range(len(parts) - 2, -1, -1):
+        month_name = parts[index].strip()
+        if not MONTH_DIRECTORY_RE.fullmatch(month_name):
+            continue
+        year_name = parts[index - 1].strip() if index else ""
+        year = int(year_name) if YEAR_DIRECTORY_RE.fullmatch(year_name) else 0
+        return year, int(month_name[:-1]), str(path).lower()
+    return 9999, 99, str(path).lower()
+
+
 def _default_output_name(directory: str | None, scope: str, target_product: str, selected_month_directories=None) -> str:
     if directory:
         path = Path(directory)
@@ -107,7 +148,7 @@ def _default_output_name(directory: str | None, scope: str, target_product: str,
 def _register_local_files(file_store: FileStore, paths) -> list[dict]:
     files = []
     seen = set()
-    for path in sorted(paths, key=lambda item: str(item).lower()):
+    for path in sorted(paths, key=_archive_sort_key):
         resolved = path.resolve()
         if resolved in seen or not path.is_file():
             continue
@@ -190,7 +231,7 @@ def build_extract_worker(file_store: FileStore):
         product_mismatch_lines = 0
         issues = []
 
-        context.log(f"准备处理 {total_zip_files} 个 ZIP 文件")
+        context.log(f"开始处理：共 {total_zip_files:,} 个压缩包")
         if scope_note:
             context.log(scope_note)
         rejected_output = extract_root / "merged_log_rejected.txt"
@@ -201,17 +242,20 @@ def build_extract_worker(file_store: FileStore):
             target_product = str(payload.get("target_product") or "").strip()
             validator = TimestampAdjuster(enabled=False)
             if target_product:
-                context.log(f"启用品种过滤：仅保留 {target_product}")
+                context.log(f"品种筛选已启用：仅保留 {target_product}")
             else:
-                context.log("未填写目标品种，仅执行格式过滤", level="warning")
+                context.log("未设置目标品种，将仅检查数据格式", level="warning")
             for file_index, item in enumerate(files, start=1):
+                context.wait_if_paused()
                 zip_path = item["resolved_path"]
-                context.log(f"正在打开压缩包: {item['name']}")
+                period_label = _archive_period_label(zip_path)
+                period_suffix = f"（{period_label}）" if period_label else ""
+                context.log(f"正在处理压缩包{period_suffix}：{item['name']}")
                 with zipfile.ZipFile(zip_path, "r") as archive:
                     members = archive.infolist()
                     total_size = sum(member.file_size for member in members)
                     if total_size > MAX_UNCOMPRESSED_BYTES:
-                        raise ValueError(f"压缩包解压后超过 2GB 限制: {item['name']}")
+                        raise ValueError(f"ZIP 内文件展开后的总大小超过 2GB 限制: {item['name']}")
 
                     for member in members:
                         if member.is_dir():
@@ -234,6 +278,7 @@ def build_extract_worker(file_store: FileStore):
                             issues.append({"zip": item["name"], "member": member.filename, "issue": issue})
                             context.log(f"{member.filename}: {issue}", level="warning")
                             continue
+                        # Stream each ZIP member directly instead of expanding archives to disk.
                         with archive.open(member, "r") as source:
                             text = io.TextIOWrapper(source, encoding="gbk", errors="replace")
                             for line_number, line in enumerate(text):
@@ -281,8 +326,10 @@ def build_extract_worker(file_store: FileStore):
 
                 context.progress(
                     file_index / total_zip_files * 95,
-                    f"已处理 {file_index}/{total_zip_files} 个压缩包",
+                    f"已处理 {file_index:,} / {total_zip_files:,} 个压缩包",
                 )
+                context.checkpoint(completed_archives=file_index)
+                context.wait_if_paused()
 
         output_name = payload.get("output_name") or _default_output_name(
             effective_directory,
@@ -295,8 +342,8 @@ def build_extract_worker(file_store: FileStore):
             f"{Path(output_name).stem}_rejected.txt",
             rejected_output,
         )
-        context.log(f"合并日志已生成: {artifact['name']}")
-        context.log(f"被过滤数据已保存: {rejected_artifact['name']}")
+        context.log(f"合并文件已生成：{artifact['name']}")
+        context.log(f"筛除的数据已另存：{rejected_artifact['name']}")
         return {
             "artifact": artifact,
             "rejected_artifact": rejected_artifact,

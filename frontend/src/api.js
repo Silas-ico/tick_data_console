@@ -21,14 +21,30 @@ export const api = {
   health: () => request('/health'),
   files: () => request('/files'),
   fileStats: () => request('/files/stats'),
+  filePreview: (id, params = {}) => {
+    const query = new URLSearchParams(params)
+    return request(`/files/${id}/preview?${query.toString()}`)
+  },
+  filePreviewIndex: (id) => request(`/files/${id}/preview-index`),
   clearHistory: () => request('/history', { method: 'DELETE' }),
   scanLocalArchives: (payload) => request('/local/archives', {
     method: 'POST',
     body: JSON.stringify(payload),
   }),
-  localDirectories: (path) => request(`/local/directories?path=${encodeURIComponent(path)}`),
+  pickLocalDirectory: (initialDirectory) => request('/local/pick-directory', {
+    method: 'POST',
+    body: JSON.stringify({ initial_directory: initialDirectory || '' }),
+  }),
   tasks: () => request('/tasks'),
   task: (id) => request(`/tasks/${id}`),
+  taskEvents: (id, params = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params).filter(([, value]) => value !== null && value !== undefined),
+    )
+    return request(`/tasks/${id}/events/history?${query.toString()}`)
+  },
+  pauseTask: (id) => request(`/tasks/${id}/pause`, { method: 'POST' }),
+  resumeTask: (id) => request(`/tasks/${id}/resume`, { method: 'POST' }),
   databaseConfig: () => request('/config/database'),
   saveDatabaseConfig: (config) => request('/config/database', {
     method: 'PUT',
@@ -45,9 +61,14 @@ export const api = {
     )
     return request(`/database/records?${query.toString()}`)
   },
+  databaseCoverage: (params) => {
+    const query = new URLSearchParams(
+      Object.entries(params || {}).filter(([, value]) => value !== '' && value !== null && value !== undefined),
+    )
+    return request(`/database/coverage?${query.toString()}`)
+  },
   extract: (payload) => request('/tasks/extract', { method: 'POST', body: JSON.stringify(payload) }),
   validate: (payload) => request('/tasks/validate', { method: 'POST', body: JSON.stringify(payload) }),
   importData: (payload) => request('/tasks/import', { method: 'POST', body: JSON.stringify(payload) }),
   eventsUrl: (id, cursor = 0) => `${API_ROOT}/tasks/${id}/events?cursor=${cursor}`,
 }
-

@@ -1,14 +1,15 @@
+import os
 from typing import Annotated
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import load_database_config, save_database_config
-from .services.archive_service import MONTH_DIRECTORY_RE, YEAR_DIRECTORY_RE, build_extract_worker
-from .services.tick_service import build_import_worker, build_validate_worker, list_tick_tables, query_tick_records, test_database
+from .services.archive_service import MONTH_DIRECTORY_RE, _archive_sort_key, archive_month_directory, build_extract_worker
+from .services.tick_service import build_import_worker, build_validate_worker, list_tick_tables, query_tick_coverage, query_tick_records, test_database
 from .storage import FileStore
 from .task_manager import TaskManager
 
@@ -16,7 +17,12 @@ from .task_manager import TaskManager
 app = FastAPI(title="Tick Data Console API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://192.168.0.109:5173"],
+    allow_origins=[
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+        "http://localhost:5175", "http://127.0.0.1:5175",
+        "http://192.168.0.109:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,22 +58,8 @@ class LocalArchiveRequest(BaseModel):
     selected_month_directories: list[str] = Field(default_factory=list)
 
 
-def _directory_sort_key(item: Path) -> tuple[int, int | str]:
-    name = item.name.strip()
-    if YEAR_DIRECTORY_RE.fullmatch(name):
-        return (0, int(name))
-    if MONTH_DIRECTORY_RE.fullmatch(name):
-        return (1, int(name[:-1]))
-    return (2, name.casefold())
-
-
-def _directory_entries(directory: Path) -> list[dict[str, object]]:
-    entries = [
-        {"name": item.name, "path": str(item.resolve())}
-        for item in directory.iterdir()
-        if item.is_dir()
-    ]
-    return sorted(entries, key=lambda item: _directory_sort_key(Path(str(item["name"]))))
+class LocalDirectoryPickerRequest(BaseModel):
+    initial_directory: str = ""
 
 
 class FileTaskRequest(BaseModel):
@@ -136,10 +128,17 @@ def get_database_records(
         raise HTTPException(status_code=400, detail=f"查询数据库数据失败: {exc}") from exc
 
 
-@app.post("/api/files/upload")
+@app.get("/api/database/coverage")
+def get_database_coverage(table_name: str, year: int | None = None, month: int | None = None):
+    try:
+        return query_tick_coverage(load_database_config(), table_name, year=year, month=month)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"读取数据覆盖统计失败: {exc}") from exc
 
+
+@app.post("/api/files/upload")
 def upload_files():
-    raise HTTPException(status_code=410, detail="上传文件功能已关闭，请使用本地目录扫描")
+    raise HTTPException(status_code=410, detail="当前仅支持从本机目录读取 ZIP，不接收文件上传")
 
 
 @app.get("/api/files")
@@ -150,6 +149,35 @@ def list_files():
 @app.get("/api/files/stats")
 def file_stats():
     return file_store.stats()
+
+
+@app.get("/api/files/{file_id}/preview")
+def preview_file(
+    file_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200),
+    line: int | None = Query(default=None, ge=1),
+):
+    try:
+        return file_store.read_artifact_preview(file_id, offset=offset, limit=limit, line=line)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="文件已被移除") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/files/{file_id}/preview-index")
+def preview_index_status(file_id: str):
+    try:
+        return file_store.preview_index_status(file_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="文件已被移除") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/local/archives")
@@ -191,12 +219,14 @@ def scan_local_archives(request: LocalArchiveRequest):
         candidates = effective_directory.glob("*.zip") if request.scope == "month" else effective_directory.glob("*.zip") if path_kind == "month" else effective_directory.rglob("*.zip")
     archives = []
     seen = set()
-    for path in sorted(candidates, key=lambda item: str(item).lower()):
+    for path in sorted(candidates, key=_archive_sort_key):
         resolved = path.resolve()
         if resolved in seen or not path.is_file():
             continue
         seen.add(resolved)
-        archives.append(file_store.register_local_path(path))
+        archive = file_store.register_local_path(path)
+        archive["month_directory"] = archive_month_directory(path, directory)
+        archives.append(archive)
     return {
         "directory": str(directory),
         "effective_directory": str(effective_directory),
@@ -209,16 +239,36 @@ def scan_local_archives(request: LocalArchiveRequest):
     }
 
 
-@app.get("/api/local/directories")
-def list_local_directories(path: str):
-    directory = Path(path).expanduser().resolve()
-    if not directory.exists() or not directory.is_dir():
-        raise HTTPException(status_code=400, detail="本地目录不存在或不是文件夹")
+@app.post("/api/local/pick-directory")
+def pick_local_directory(request: Request, payload: LocalDirectoryPickerRequest):
+    # This dialog belongs to the machine running FastAPI, so remote browsers must not trigger it.
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(status_code=403, detail="原生目录选择仅允许本机调用")
+    if os.name != "nt":
+        raise HTTPException(status_code=501, detail="原生目录选择仅支持 Windows，请手动填写目录")
     try:
-        children = _directory_entries(directory)
-    except OSError as exc:
-        raise HTTPException(status_code=400, detail=f"读取本地目录失败: {exc}") from exc
-    return {"directory": str(directory), "directories": children}
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            initial_directory = Path(payload.initial_directory).expanduser()
+            if not initial_directory.is_dir():
+                initial_directory = Path.home()
+            selected_directory = filedialog.askdirectory(
+                parent=root,
+                title="选择 ZIP 数据文件夹",
+                initialdir=str(initial_directory),
+                mustexist=True,
+            )
+        finally:
+            root.destroy()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"无法打开 Windows 文件夹窗口: {exc}") from exc
+    return {"directory": str(Path(selected_directory).resolve()) if selected_directory else ""}
 
 
 @app.post("/api/tasks/extract")
@@ -226,35 +276,49 @@ def create_extract_task(request: ExtractRequest):
     if not request.file_ids and not request.source_directory:
         raise HTTPException(status_code=400, detail="请选择 ZIP 文件或填写本地目录")
     try:
+        source_names = []
         for file_id in request.file_ids:
-            file_store.get(file_id)
+            source_names.append(file_store.get(file_id)["name"])
         if request.source_directory:
             directory = Path(request.source_directory).expanduser()
             if not directory.exists() or not directory.is_dir():
                 raise ValueError("本地目录不存在或不是文件夹")
+            source_name = str(directory)
+        elif len(source_names) == 1:
+            source_name = source_names[0]
+        else:
+            source_name = f"{len(source_names)} 个 ZIP 文件"
     except (KeyError, FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=f"处理源不存在: {exc}") from exc
-    return task_manager.create("extract", request.model_dump(), build_extract_worker(file_store))
+    return task_manager.create(
+        "extract",
+        {**request.model_dump(), "display_name": source_name},
+        build_extract_worker(file_store),
+    )
 
 
 @app.post("/api/tasks/validate")
 def create_validate_task(request: FileTaskRequest):
     try:
-        file_store.get(request.file_id)
+        item = file_store.get(request.file_id)
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=f"文件不存在: {exc}") from exc
-    return task_manager.create("validate", request.model_dump(), build_validate_worker(file_store))
+    return task_manager.create(
+        "validate",
+        {**request.model_dump(), "display_name": item["name"]},
+        build_validate_worker(file_store),
+    )
 
 
 @app.post("/api/tasks/import")
 def create_import_task(request: ImportRequest):
     try:
-        file_store.get(request.file_id)
+        item = file_store.get(request.file_id)
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=f"文件不存在: {exc}") from exc
     return task_manager.create(
         "import",
-        request.model_dump(),
+        {**request.model_dump(), "display_name": item["name"]},
         build_import_worker(file_store, load_database_config),
     )
 
@@ -282,6 +346,41 @@ def get_task(task_id: str):
         raise HTTPException(status_code=404, detail="任务不存在") from exc
 
 
+@app.get("/api/tasks/{task_id}/events/history")
+def task_event_history(
+    task_id: str,
+    before_id: int | None = Query(default=None, ge=1),
+    after_id: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=500, ge=1, le=500),
+):
+    try:
+        return task_manager.event_page(
+            task_id, before_id=before_id, after_id=after_id, limit=limit
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+
+
+@app.post("/api/tasks/{task_id}/pause")
+def pause_task(task_id: str):
+    try:
+        return task_manager.pause(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/resume")
+def resume_task(task_id: str):
+    try:
+        return task_manager.resume(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/tasks/{task_id}/events")
 def task_events(
     task_id: str,
@@ -305,4 +404,3 @@ def task_events(
             "X-Accel-Buffering": "no",
         },
     )
-

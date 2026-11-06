@@ -1,17 +1,65 @@
 import json
 import re
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import RLock
+from time import time
 from typing import Iterator
 
 import pymysql
 
 from ..storage import FileStore
 from ..task_manager import TaskContext
+from ..config import DATA_DIR
 
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
+COVERAGE_CACHE_TTL = 24 * 60 * 60
+_coverage_cache_lock = RLock()
+_coverage_year_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+_coverage_cache_path = DATA_DIR / "coverage_cache.json"
+
+
+def _load_coverage_cache() -> None:
+    try:
+        payload = json.loads(_coverage_cache_path.read_text(encoding="utf-8"))
+        now = time()
+        for key, value in payload.items():
+            database, table = key.split("/", 1)
+            cached_at = float(value["cached_at"])
+            years = value["years"]
+            if now - cached_at < COVERAGE_CACHE_TTL and isinstance(years, list):
+                _coverage_year_cache[(database, table)] = (cached_at, years)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return
+
+
+def _persist_coverage_cache() -> None:
+    payload = {
+        f"{database}/{table}": {"cached_at": cached_at, "years": years}
+        for (database, table), (cached_at, years) in _coverage_year_cache.items()
+    }
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", dir=DATA_DIR, delete=False) as temporary:
+            json.dump(payload, temporary, ensure_ascii=False)
+            temporary_path = Path(temporary.name)
+        temporary_path.replace(_coverage_cache_path)
+    except OSError:
+        if temporary_path:
+            temporary_path.unlink(missing_ok=True)
+
+
+_load_coverage_cache()
+
+
+def invalidate_coverage_cache(database: str, table_name: str) -> None:
+    with _coverage_cache_lock:
+        _coverage_year_cache.pop((database.lower(), table_name.lower()), None)
+        _persist_coverage_cache()
 
 
 def validate_identifier(value: str, label: str) -> str:
@@ -237,7 +285,7 @@ def build_validate_worker(file_store: FileStore):
         counters = Counter()
         samples = []
         preview = []
-        context.log(f"使用 {encoding} 编码检查文件: {item['name']}")
+        context.log(f"开始检查文件：{item['name']}（{encoding} 编码）")
 
         for line_num, line in enumerate(iter_lines(path, encoding), start=1):
             stripped = line.strip()
@@ -287,7 +335,10 @@ def build_validate_worker(file_store: FileStore):
                     for key, value in data.items()
                 })
             if line_num % 500 == 0:
-                context.progress(line_num / total_lines * 98, f"已检查 {line_num}/{total_lines} 行")
+                context.progress(
+                    line_num / total_lines * 98,
+                    f"已检查 {line_num:,} / {total_lines:,} 行",
+                )
 
         issue_counts = {
             key: value
@@ -555,19 +606,178 @@ def query_tick_records(
     }
 
 
+def query_tick_coverage(config: dict, table_name: str, year: int | None = None, month: int | None = None) -> dict:
+    table = validate_identifier(str(table_name or ""), "表名")
+    available_tables = list_tick_tables(config)
+    table_lookup = {item["name"].lower(): item for item in available_tables}
+    selected_table = table_lookup.get(table.lower())
+    if not selected_table:
+        raise ValueError("只能查询本地数据库中已发现的 tick_data_% 表")
+    safe_table = validate_identifier(selected_table["name"], "表名")
+    now = datetime.now()
+    today = now.date()
+    week_start = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+    year_start = date(today.year, 1, 1)
+    next_year_start = date(today.year + 1, 1, 1)
+    if month_start.month == 12:
+        next_month_start = date(month_start.year + 1, 1, 1)
+    else:
+        next_month_start = date(month_start.year, month_start.month + 1, 1)
+
+    connection = connect_database(config)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS total FROM information_schema.statistics "
+                "WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'tick_time'",
+                (safe_table,),
+            )
+            if int((cursor.fetchone() or {}).get("total") or 0) == 0:
+                raise ValueError("该表没有 tick_time 索引。为避免全表扫描，日期覆盖统计已停止；请先为 tick_time 建立索引")
+
+            cache_key = (str(config["database"]).lower(), safe_table.lower())
+            cached_years = None
+            if year is None:
+                with _coverage_cache_lock:
+                    cached = _coverage_year_cache.get(cache_key)
+                    if cached and time() - cached[0] < COVERAGE_CACHE_TTL:
+                        cached_years = [dict(item) for item in cached[1]]
+            if year is None and cached_years is None:
+                cursor.execute(
+                    f"SELECT MIN(`tick_time`) AS min_time, MAX(`tick_time`) AS max_time FROM `{safe_table}`"
+                )
+                endpoints = cursor.fetchone() or {}
+                if endpoints.get("min_time") is None:
+                    years = []
+                else:
+                    first_year = endpoints["min_time"].year
+                    last_year = endpoints["max_time"].year
+                    years = []
+                    for current_year in range(first_year, last_year + 1):
+                        cursor.execute(
+                            f"SELECT COUNT(*) AS total FROM `{safe_table}` WHERE `tick_time` >= %s AND `tick_time` < %s",
+                            (date(current_year, 1, 1), date(current_year + 1, 1, 1)),
+                        )
+                        year_count = int((cursor.fetchone() or {}).get("total") or 0)
+                        if year_count:
+                            years.append({"year": current_year, "total": year_count})
+                    years.reverse()
+                with _coverage_cache_lock:
+                    _coverage_year_cache[cache_key] = (time(), [dict(item) for item in years])
+                    _persist_coverage_cache()
+            elif year is None:
+                years = cached_years
+
+            if year is None:
+                if not years:
+                    return {
+                        "database": config["database"], "table": selected_table,
+                        "total": 0, "min_year": None, "max_year": None,
+                        "periods": {"day": 0, "week": 0, "month": 0, "year": 0},
+                        "years": [], "selected_year": None, "selected_year_total": 0,
+                        "months": [], "selected_month": None, "selected_month_total": 0, "days": [],
+                    }
+                selected_year = int(years[0]["year"])
+                year_total = int(years[0]["total"])
+                total = sum(item["total"] for item in years)
+                min_year = min(item["year"] for item in years)
+                max_year = max(item["year"] for item in years)
+            else:
+                selected_year = int(year)
+                if not 1 <= selected_year < 9999:
+                    raise ValueError("所选年份超出支持范围")
+                selected_year_start = date(selected_year, 1, 1)
+                selected_year_end = date(selected_year + 1, 1, 1)
+                cursor.execute(
+                    f"SELECT COUNT(*) AS total FROM `{safe_table}` WHERE `tick_time` >= %s AND `tick_time` < %s",
+                    (selected_year_start, selected_year_end),
+                )
+                year_total = int((cursor.fetchone() or {}).get("total") or 0)
+                if year_total == 0:
+                    raise ValueError("所选年份没有入库数据")
+                years = None
+                total = None
+                min_year = None
+                max_year = None
+            if month is not None and not 1 <= int(month) <= 12:
+                raise ValueError("月份必须在 1 到 12 之间")
+            selected_month = int(month) if month is not None else None
+            selected_year_start = date(selected_year, 1, 1)
+            selected_year_end = date(selected_year + 1, 1, 1)
+            cursor.execute(
+                "SELECT MONTH(`tick_time`) AS month, COUNT(*) AS total "
+                f"FROM `{safe_table}` WHERE `tick_time` >= %s AND `tick_time` < %s "
+                "GROUP BY MONTH(`tick_time`) ORDER BY month",
+                (selected_year_start, selected_year_end),
+            )
+            months = [{"month": int(row["month"]), "total": int(row["total"])} for row in cursor.fetchall()]
+            if selected_month is not None:
+                selected_month_start = date(selected_year, selected_month, 1)
+                selected_month_end = date(selected_year + 1, 1, 1) if selected_month == 12 else date(selected_year, selected_month + 1, 1)
+                cursor.execute(
+                    "SELECT DAY(`tick_time`) AS day, COUNT(*) AS total "
+                    f"FROM `{safe_table}` WHERE `tick_time` >= %s AND `tick_time` < %s "
+                    "GROUP BY DAY(`tick_time`) ORDER BY day",
+                    (selected_month_start, selected_month_end),
+                )
+                days = [{"day": int(row["day"]), "total": int(row["total"])} for row in cursor.fetchall()]
+                month_total = next((item["total"] for item in months if item["month"] == selected_month), 0)
+            else:
+                days = []
+                month_total = 0
+
+            period_row = {}
+            for key, start_at, end_at in (
+                ("day_total", today, today + timedelta(days=1)),
+                ("week_total", week_start, today + timedelta(days=1)),
+                ("month_total", month_start, next_month_start),
+            ):
+                cursor.execute(
+                    f"SELECT COUNT(*) AS total FROM `{safe_table}` WHERE `tick_time` >= %s AND `tick_time` < %s",
+                    (start_at, end_at),
+                )
+                period_row[key] = (cursor.fetchone() or {}).get("total", 0)
+            period_row["year_total"] = year_total if selected_year == today.year else 0
+    finally:
+        connection.close()
+
+    return {
+        "database": config["database"],
+        "table": selected_table,
+        "total": total,
+        "min_year": min_year,
+        "max_year": max_year,
+        "periods": {
+            "day": int(period_row.get("day_total") or 0),
+            "week": int(period_row.get("week_total") or 0),
+            "month": int(period_row.get("month_total") or 0),
+            "year": int(period_row.get("year_total") or 0),
+        },
+        "years": years,
+        "selected_year": selected_year,
+        "selected_year_total": year_total,
+        "months": months,
+        "selected_month": selected_month,
+        "selected_month_total": month_total,
+        "days": days,
+    }
+
+
 def build_import_worker(file_store: FileStore, database_config_loader):
     def worker(context: TaskContext, payload: dict) -> dict:
         item = file_store.get(payload["file_id"])
         path = item["resolved_path"]
         table_name = validate_identifier(payload["table_name"], "表名")
         config = database_config_loader()
-        context.log(f"连接本地数据库 {config['host']}:{config['port']}/{config['database']}")
+        context.log(f"正在连接数据库：{config['host']}:{config['port']} / {config['database']}")
         ensure_database(config)
         connection = connect_database(config)
         encoding = detect_encoding(path)
         total_lines = count_lines(path)
         adjuster = TimestampAdjuster(bool(payload.get("adjust_duplicates", True)))
         stats = Counter()
+        file_months = Counter()
         errors = []
         placeholders = ", ".join(["%s"] * len(INSERT_COLUMNS))
         quoted_columns = ", ".join(f"`{column}`" for column in INSERT_COLUMNS)
@@ -582,7 +792,7 @@ def build_import_worker(file_store: FileStore, database_config_loader):
                 raise ValueError(
                     f"日志文件品种与目标表不匹配: 文件={file_product}，目标表={table_name}"
                 )
-            context.log(f"确认目标数据表存在且匹配: {table_name}")
+            context.log(f"目标数据表已确认：{table_name}")
             with connection.cursor() as cursor:
                 for line_num, line in enumerate(iter_lines(path, encoding), start=1):
                     stripped = line.strip()
@@ -601,6 +811,7 @@ def build_import_worker(file_store: FileStore, database_config_loader):
                         if len(errors) < 100:
                             errors.append({"line": line_num, "message": convert_error})
                         continue
+                    file_months[data["tick_time"].strftime("%Y-%m")] += 1
                     values = tuple(data.get(column) for column in INSERT_COLUMNS)
                     try:
                         cursor.execute(sql, values)
@@ -616,20 +827,34 @@ def build_import_worker(file_store: FileStore, database_config_loader):
                             errors.append({"line": line_num, "message": str(exc)})
                     if line_num % 500 == 0:
                         connection.commit()
-                        context.progress(line_num / total_lines * 98, f"已导入 {line_num}/{total_lines} 行")
+                        context.progress(
+                            line_num / total_lines * 98,
+                            f"已处理 {line_num:,} / {total_lines:,} 行",
+                        )
                     if line_num % 2000 == 0:
                         context.log(
-                            f"进度 {line_num}/{total_lines}，新增 {stats['inserted']}，"
-                            f"重复 {stats['duplicates']}，失败 {stats['failed_parse'] + stats['failed_insert']}"
+                            f"阶段统计：已处理 {line_num:,} 行；新增 {stats['inserted']:,} 条，"
+                            f"重复 {stats['duplicates']:,} 条，失败 {stats['failed_parse'] + stats['failed_insert']:,} 条"
                         )
             connection.commit()
+            invalidate_coverage_cache(config["database"], table_name)
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"SELECT COUNT(*) AS count, MIN(tick_time) AS min_time, "
                     f"MAX(tick_time) AS max_time FROM `{table_name}`"
                 )
                 database_stats = cursor.fetchone()
-            context.log(f"导入完成，成功新增 {stats['inserted']} 条，跳过重复 {stats['duplicates']} 条")
+            months = sorted(file_months)
+            if months:
+                month_labels = [f"{month[:4]}年{int(month[5:])}月" for month in months]
+                context.log(f"数据日期范围：共涉及 {len(months)} 个月份（{'、'.join(month_labels)}）")
+            else:
+                month_labels = []
+                context.log("未识别到有效的 Tick 日期")
+            context.log(
+                f"导入完成：新增 {stats['inserted']:,} 条，重复 {stats['duplicates']:,} 条，"
+                f"解析失败 {stats['failed_parse']:,} 条，写入失败 {stats['failed_insert']:,} 条"
+            )
             return {
                 "file": FileStore.public_item(item),
                 "database": config["database"],
@@ -642,6 +867,8 @@ def build_import_worker(file_store: FileStore, database_config_loader):
                 "failed_insert": stats["failed_insert"],
                 "empty_lines": stats["empty_lines"],
                 "timestamp_adjustments": stats["timestamp_adjustments"],
+                "file_months": months,
+                "file_month_range": {"start": months[0], "end": months[-1]} if months else None,
                 "errors": errors,
                 "database_stats": {
                     key: str(value) if value is not None else None

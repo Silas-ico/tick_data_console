@@ -1,4 +1,5 @@
 import asyncio
+from bisect import bisect_left, bisect_right
 import json
 import os
 import tempfile
@@ -9,12 +10,13 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Callable
+from typing import Callable, List
 
 from .config import TASK_DIR, ensure_data_dirs
 
 
 TERMINAL_STATUSES = {"success", "failed"}
+PAUSABLE_STATUSES = {"pending", "running"}
 
 
 class TaskContext:
@@ -28,23 +30,52 @@ class TaskContext:
     def progress(self, value: float, message: str = "") -> None:
         self.manager.update_progress(self.task_id, value, message)
 
+    def wait_if_paused(self) -> None:
+        self.manager.wait_if_paused(self.task_id)
+
+    def checkpoint(self, **values) -> None:
+        self.manager.checkpoint(self.task_id, values)
+
 
 class TaskManager:
     def __init__(self) -> None:
         self._lock = RLock()
         ensure_data_dirs()
         self._tasks: dict[str, dict] = {}
+        self._pause_conditions: dict[str, threading.Condition] = {}
+        self._last_progress_event: dict[str, tuple[float, float]] = {}
         self._load_tasks()
 
     def _load_tasks(self) -> None:
         for task_file in TASK_DIR.glob("*.json"):
             try:
                 task = json.loads(task_file.read_text(encoding="utf-8"))
-                if task.get("status") in {"pending", "running"}:
+                event_path = self._event_path(task["id"])
+                if event_path.exists():
+                    task["events"] = []
+                    for line in event_path.read_text(encoding="utf-8").splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            task["events"].append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    task.setdefault("events", [])
+                    if task["events"]:
+                        event_path.write_text(
+                            "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in task["events"]),
+                            encoding="utf-8",
+                        )
+                task["next_event_id"] = max(
+                    task.get("next_event_id", 1),
+                    task["events"][-1]["id"] + 1 if task["events"] else 1,
+                )
+                if task.get("status") in {"pending", "running", "pausing", "paused"}:
                     task["status"] = "failed"
                     task["finished_at"] = datetime.now().isoformat(timespec="seconds")
-                    task["error"] = "服务重启，原后台任务已中断"
-                    self._append_event(task, "status", "服务重启，任务已标记为失败", level="error")
+                    task["error"] = "服务重启，任务已中断；进程内暂停任务不能跨重启续传"
+                    self._append_event(task, "status", task["error"], level="error")
                     self._persist(task)
                 self._tasks[task["id"]] = task
             except (OSError, json.JSONDecodeError, KeyError, TypeError):
@@ -53,10 +84,18 @@ class TaskManager:
     def _task_path(self, task_id: str) -> Path:
         return TASK_DIR / f"{task_id}.json"
 
+    def _event_path(self, task_id: str) -> Path:
+        return TASK_DIR / f"{task_id}.events.jsonl"
+
     def _persist(self, task: dict) -> None:
         """Persist a task safely on Windows, including transient file locks."""
         target = self._task_path(task["id"])
-        payload = json.dumps(task, ensure_ascii=False, indent=2)
+        payload = json.dumps(
+            {key: value for key, value in task.items() if key != "events"},
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{task['id']}.", suffix=".tmp", dir=str(TASK_DIR)
         )
@@ -81,8 +120,8 @@ class TaskManager:
         finally:
             temporary.unlink(missing_ok=True)
 
-    @staticmethod
     def _append_event(
+        self,
         task: dict,
         event_type: str,
         message: str,
@@ -101,6 +140,8 @@ class TaskManager:
         }
         task.setdefault("events", []).append(event)
         task["next_event_id"] = event["id"] + 1
+        with self._event_path(task["id"]).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
         return event
 
     def create(self, task_type: str, payload: dict, worker: Callable[[TaskContext, dict], dict]) -> dict:
@@ -111,7 +152,7 @@ class TaskManager:
             "type": task_type,
             "status": "pending",
             "progress": 0,
-            "message": "任务等待启动",
+            "message": "任务已创建，等待开始",
             "payload": payload,
             "result": None,
             "error": None,
@@ -120,10 +161,12 @@ class TaskManager:
             "finished_at": None,
             "events": [],
             "next_event_id": 1,
+            "checkpoint": {},
         }
-        self._append_event(task, "status", "任务已创建")
+        self._append_event(task, "status", "任务已创建，等待开始")
         with self._lock:
             self._tasks[task_id] = task
+            self._pause_conditions[task_id] = threading.Condition(self._lock)
             self._persist(task)
 
         thread = threading.Thread(
@@ -138,10 +181,11 @@ class TaskManager:
     def _run(self, task_id: str, worker: Callable[[TaskContext, dict], dict]) -> None:
         with self._lock:
             task = self._tasks[task_id]
-            task["status"] = "running"
-            task["started_at"] = datetime.now().isoformat(timespec="seconds")
-            task["message"] = "任务正在运行"
-            self._append_event(task, "status", "任务开始运行")
+            if task["status"] not in {"paused", "pausing"}:
+                task["status"] = "running"
+                task["started_at"] = datetime.now().isoformat(timespec="seconds")
+                task["message"] = "任务正在运行"
+                self._append_event(task, "status", "任务开始运行")
             self._persist(task)
 
         context = TaskContext(self, task_id)
@@ -151,22 +195,22 @@ class TaskManager:
                 task = self._tasks[task_id]
                 task["status"] = "success"
                 task["progress"] = 100
-                task["message"] = "任务执行完成"
+                task["message"] = "任务已完成"
                 task["result"] = result
                 task["finished_at"] = datetime.now().isoformat(timespec="seconds")
-                self._append_event(task, "result", "任务执行完成", data=result)
+                self._append_event(task, "result", "任务已完成", data=result)
                 self._persist(task)
         except Exception as exc:
             with self._lock:
                 task = self._tasks[task_id]
                 task["status"] = "failed"
-                task["message"] = "任务执行失败"
+                task["message"] = "任务失败，请查看错误详情"
                 task["error"] = str(exc)
                 task["finished_at"] = datetime.now().isoformat(timespec="seconds")
                 self._append_event(
                     task,
                     "error",
-                    str(exc),
+                    f"任务失败：{exc}",
                     level="error",
                     data={"traceback": traceback.format_exc(limit=8)},
                 )
@@ -190,11 +234,75 @@ class TaskManager:
     def update_progress(self, task_id: str, value: float, message: str = "") -> None:
         with self._lock:
             task = self._tasks[task_id]
+            previous_progress = task.get("progress", 0)
             task["progress"] = max(0, min(100, round(float(value), 2)))
             if message:
                 task["message"] = message
+            now = time.monotonic()
+            last_time, last_progress = self._last_progress_event.get(
+                task_id, (0.0, previous_progress)
+            )
+            if now - last_time < 1.0 and task["progress"] - last_progress < 0.5:
+                return
             self._append_event(task, "progress", message or "进度更新")
+            self._last_progress_event[task_id] = (now, task["progress"])
             self._persist(task)
+
+    def checkpoint(self, task_id: str, values: dict) -> None:
+        with self._lock:
+            task = self._tasks[task_id]
+            task.setdefault("checkpoint", {}).update(values)
+            self._persist(task)
+
+    def wait_if_paused(self, task_id: str) -> None:
+        with self._lock:
+            condition = self._pause_conditions[task_id]
+            task = self._tasks[task_id]
+            if task.get("status") == "pausing":
+                task["status"] = "paused"
+                task["message"] = "任务已暂停，等待继续"
+                self._append_event(task, "status", "任务已暂停，可继续运行")
+                self._persist(task)
+            while self._tasks[task_id].get("status") == "paused":
+                condition.wait()
+            task = self._tasks[task_id]
+            if task.get("status") == "pending":
+                task["status"] = "running"
+                task["started_at"] = task.get("started_at") or datetime.now().isoformat(timespec="seconds")
+                task["message"] = "任务正在运行"
+                self._append_event(task, "status", "任务继续运行")
+                self._persist(task)
+
+    def pause(self, task_id: str) -> dict:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                raise KeyError(task_id)
+            if task.get("status") not in PAUSABLE_STATUSES:
+                raise RuntimeError("只有等待中或运行中的任务可以暂停")
+            if task.get("type") != "extract":
+                raise RuntimeError("当前只有压缩处理任务支持暂停")
+            task["status"] = "pausing"
+            task["message"] = "正在完成当前压缩包，随后暂停"
+            self._append_event(task, "status", "已收到暂停请求，当前压缩包处理完后暂停")
+            self._persist(task)
+            return self.snapshot(task_id)
+
+    def resume(self, task_id: str) -> dict:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                raise KeyError(task_id)
+            if task.get("status") not in {"paused", "pausing"}:
+                raise RuntimeError("只有已暂停的任务可以继续")
+            task["status"] = "running"
+            task["message"] = "任务正在继续"
+            self._append_event(task, "status", "任务继续运行")
+            self._persist(task)
+            condition = self._pause_conditions.get(task_id)
+            if condition:
+                condition.notify_all()
+            return self.snapshot(task_id)
 
     def snapshot(self, task_id: str, include_events: bool = False) -> dict:
         with self._lock:
@@ -202,6 +310,7 @@ class TaskManager:
             if not task:
                 raise KeyError(task_id)
             result = dict(task)
+            result["last_event_id"] = task.get("next_event_id", 1) - 1
             if not include_events:
                 result.pop("events", None)
                 result.pop("next_event_id", None)
@@ -226,7 +335,10 @@ class TaskManager:
             task_files = list(TASK_DIR.glob("*.json"))
             for task_file in task_files:
                 task_file.unlink(missing_ok=True)
+            for event_file in TASK_DIR.glob("*.events.jsonl"):
+                event_file.unlink(missing_ok=True)
             self._tasks.clear()
+            self._last_progress_event.clear()
 
         return {"tasks": task_count, "task_files": len(task_files)}
 
@@ -238,7 +350,7 @@ class TaskManager:
                 task = self._tasks.get(task_id)
                 if not task:
                     return
-                events = [event for event in task["events"] if event["id"] > cursor]
+                events = self._events_after(task, cursor, 250)
                 status = task["status"]
 
             if events:
@@ -255,3 +367,37 @@ class TaskManager:
                     idle_rounds = 0
                     yield ": keep-alive\n\n"
             await asyncio.sleep(0.5)
+
+    @staticmethod
+    def _events_after(task: dict, cursor: int, limit: int) -> List[dict]:
+        events = task.get("events", [])
+        if not events:
+            return []
+        start = bisect_right(events, cursor, key=lambda event: event["id"])
+        return events[start:start + limit]
+
+    def event_page(
+        self,
+        task_id: str,
+        *,
+        before_id: int | None = None,
+        after_id: int | None = None,
+        limit: int = 500,
+    ) -> dict:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                raise KeyError(task_id)
+            events = task.get("events", [])
+            if before_id is not None:
+                end = bisect_left(events, before_id, key=lambda event: event["id"])
+                page = events[max(0, end - limit):end]
+                has_more = bool(page) and page[0]["id"] > events[0]["id"]
+            elif after_id is not None:
+                start = bisect_right(events, after_id, key=lambda event: event["id"])
+                page = events[start:start + limit]
+                has_more = bool(page) and page[-1]["id"] < events[-1]["id"]
+            else:
+                page = events[-limit:]
+                has_more = len(events) > len(page)
+            return {"events": list(page), "has_more": has_more}
