@@ -83,6 +83,62 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(validate_result["result"]["invalid_lines"], 0)
         self.assertEqual(validate_result["result"]["timestamp_adjustments"], 1)
 
+    def test_year_extract_tasks_run_concurrently_without_mixing_outputs(self):
+        barrier = threading.Barrier(2)
+        workers_started = []
+        workers_lock = threading.Lock()
+
+        def make_worker():
+            extract_worker = build_extract_worker(self.file_store)
+
+            def worker(context, payload):
+                with workers_lock:
+                    workers_started.append(context.task_id)
+                barrier.wait(timeout=3)
+                return extract_worker(context, payload)
+
+            return worker
+
+        task_ids = []
+        source_records = {}
+        for year, tick_id in ((2021, 2101), (2022, 2201)):
+            year_directory = Path(self.temporary.name) / "BU" / str(year)
+            month_directory = year_directory / "1月"
+            month_directory.mkdir(parents=True)
+            log_text = "\n".join([
+                "STATS:已采集天数 1",
+                f'TICK_DATA:{{"tick_id": {tick_id}, "code": "BU2106.XSGE", "underlying_symbol": "BU", "datetime": "{year}-01-04 09:00:00", "current": 2500, "high": 2501, "low": 2499, "volume": 10, "ask1_price": 2501, "bid1_price": 2500}}',
+                "取消已订阅的所有标的",
+            ])
+            with zipfile.ZipFile(month_directory / f"log-{year}.zip", "w") as archive:
+                archive.writestr("log.txt", log_text.encode("gbk"))
+            source_records[year] = tick_id
+            task = self.tasks.create(
+                "extract",
+                {
+                    "source_directory": str(year_directory),
+                    "merge_scope": "year",
+                    "target_product": "BU",
+                    "output_name": f"BU_{year}.txt",
+                    "display_name": str(year_directory),
+                },
+                make_worker(),
+            )
+            task_ids.append(task["id"])
+
+        results = [self.wait_for_task(self.tasks, task_id) for task_id in task_ids]
+        self.assertEqual(workers_started, task_ids)
+        self.assertTrue(all(result["status"] == "success" for result in results))
+
+        output_text = {}
+        for year, result in zip((2021, 2022), results):
+            artifact = self.file_store.get(result["result"]["artifact"]["id"])
+            output_text[year] = artifact["resolved_path"].read_text(encoding="utf-8")
+            self.assertIn(f'"tick_id": {source_records[year]}', output_text[year])
+            other_year = 2022 if year == 2021 else 2021
+            self.assertNotIn(f'"tick_id": {source_records[other_year]}', output_text[year])
+        self.assertNotEqual(results[0]["result"]["artifact"]["id"], results[1]["result"]["artifact"]["id"])
+
     def test_clear_history_and_uploaded_archives(self):
         upload = self.file_store.save_upload("sample.zip", io.BytesIO(b"zip-content"))
         artifact_path = storage.ARTIFACT_DIR / "artifact.txt"

@@ -193,7 +193,7 @@ const navigation = [
 ]
 
 const page = computed(() => navigation.find((item) => item.id === section.value) || navigation[0])
-const activeExtractTask = computed(() => tasks.value.find((task) =>
+const activeExtractTasks = computed(() => tasks.value.filter((task) =>
   task.type === 'extract' && ['pending', 'running', 'pausing', 'paused'].includes(task.status),
 ))
 const fileBreakdown = computed(() => {
@@ -468,6 +468,7 @@ function typeLabel(type) {
 
 function taskSourceLabel(task) {
   if (!task) return ''
+  if (task.type === 'extract' && task.payload?.output_name) return task.payload.output_name
   if (task.payload?.display_name) return task.payload.display_name
   const fileId = task.payload?.file_id
   if (fileId) return files.value.find((file) => file.id === fileId)?.name || `文件 ${fileId.slice(0, 8)}`
@@ -634,12 +635,12 @@ function eventTone(level) {
             <label class="field"><span>目标品种 <i class="field-hint">来自本地数据库</i></span><select v-model="targetProduct" :disabled="targetProductLocked"><option value="">请选择目标品种</option><option v-for="product in databaseTables" :key="product.code" :value="product.code">{{ product.label }}</option></select><small v-if="databaseTablesError" class="error-text">{{ databaseTablesError }}</small><small v-else-if="targetProductLocked" class="matched-text">✓ 已根据本地目录自动匹配 {{ targetProduct }}</small><small v-else-if="!databaseTables.length">请先配置数据库并确保存在 `tick_data_品种代码` 表。</small></label>
             <div class="filter-tip"><span>✓</span><p>按 <code>underlying_symbol</code>、<code>code</code> 和 <code>commodity_name</code> 筛选目标品种；格式错误、字段异常或品种不匹配的数据会写入异常数据文件（rejected）。</p></div>
             <div class="flow-steps"><span>读取 ZIP</span><i>→</i><span>定位 log.txt</span><i>→</i><span>筛选有效 Tick</span><i>→</i><span>写入合并日志</span></div>
-            <div v-if="activeExtractTask" class="extract-task-state" :class="activeExtractTask.status">
-              <div><b>{{ activeExtractTask.status === 'paused' ? '合并任务已暂停' : 'ZIP 正在合并' }}</b><small>{{ activeExtractTask.message }} · {{ activeExtractTask.progress || 0 }}%</small></div>
+            <div v-if="activeExtractTasks.length" class="extract-task-state concurrent">
+              <div class="concurrent-task-summary"><b>已有 {{ activeExtractTasks.length }} 个合并任务运行中</b><small>当前页面仍可启动新的年份或月份合并，任务会独立执行</small><span v-for="task in activeExtractTasks.slice(0, 3)" :key="task.id">{{ taskSourceLabel(task) }} · {{ task.progress || 0 }}%</span><span v-if="activeExtractTasks.length > 3">还有 {{ activeExtractTasks.length - 3 }} 个任务</span></div>
               <button type="button" class="text-button" @click="section = 'logs'">查看任务</button>
             </div>
-            <button class="primary-button full" :disabled="busy.extract || busy.upload || !localArchives.length || Boolean(activeExtractTask)" @click="startExtract">
-              {{ busy.extract ? '正在创建任务…' : activeExtractTask ? (activeExtractTask.status === 'paused' ? '已有暂停任务，请先处理该任务' : '已有合并任务正在运行') : `开始${mergeScope === 'year' ? '全年' : '按月'}合并 ${selectedLocalArchiveIds.length} / ${localArchives.length} 个 ZIP` }}
+            <button class="primary-button full" :disabled="busy.extract || busy.upload || !localArchives.length" @click="startExtract">
+              {{ busy.extract ? '正在创建任务…' : activeExtractTasks.length ? `并发启动${mergeScope === 'year' ? '全年' : '按月'}合并` : `开始${mergeScope === 'year' ? '全年' : '按月'}合并 ${selectedLocalArchiveIds.length} / ${localArchives.length} 个 ZIP` }}
             </button>
           </article>
         </div>

@@ -644,10 +644,6 @@ export function useConsole() {
 
   function startExtract() {
     // Scanned local IDs preserve the user's exact ZIP selection instead of rescanning the whole folder.
-    if (tasks.value.some((task) => task.type === 'extract' && ['pending', 'running', 'pausing', 'paused'].includes(task.status))) {
-      showNotice('已有 ZIP 合并任务尚未结束，请先在运行日志中查看或继续该任务', 'error')
-      return
-    }
     const archiveIds = localArchives.value.length ? selectedLocalArchiveIds.value : selectedZipIds.value
     if (!localDirectory.value.trim() && !archiveIds.length) {
       showNotice('请先选择 ZIP 文件', 'error')

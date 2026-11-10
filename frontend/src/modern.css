@@ -1010,6 +1010,23 @@ select {
   background: #fff9eb;
 }
 
+.extract-task-state.concurrent {
+  border-color: #bfd3ff;
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.extract-task-state.concurrent small {
+  color: #526b88;
+}
+
+.concurrent-task-summary span {
+  display: block;
+  margin-top: 2px;
+  color: #526b88;
+  font-size: 10px;
+}
+
 .extract-task-state b,
 .extract-task-state small {
   display: block;
